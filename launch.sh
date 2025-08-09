@@ -13,10 +13,7 @@ env() {
     export github_project=$(jq -r .github_project data.json)
   fi
 
-  echo
-  echo "fetch = ${fetch}"
-  echo "github_secret = ${github_secret}"
-  echo "github_project = ${github_project}"
+
   echo
 
   sed -i "s/\[github_secret\]/${github_secret}/g" launch.sh
