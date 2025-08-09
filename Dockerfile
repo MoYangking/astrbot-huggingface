@@ -28,7 +28,7 @@ RUN if [ ! -z "${PIP_PACKAGES}" ]; then pip install ${PIP_PACKAGES}; fi
 WORKDIR ${APP_HOME}
 
 # 拉取 gemini-balance 最新代码
-RUN rm -rf ${APP_HOME}/app && \
+RUN rm -rf ${APP_HOME} && \
     git clone --depth=1 https://github.com/snailyp/gemini-balance.git ${APP_HOME}
 
 # 安装 gemini-balance 的 requirements.txt
