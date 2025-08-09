@@ -29,13 +29,10 @@ WORKDIR ${APP_HOME}
 
 # 拉取 gemini-balance 最新代码
 RUN rm -rf ${APP_HOME}/app && \
-    git clone --depth=1 https://github.com/snailyp/gemini-balance.git ${APP_HOME}/app
+    git clone --depth=1 https://github.com/snailyp/gemini-balance.git ${APP_HOME}
 
 # 安装 gemini-balance 的 requirements.txt
-RUN pip install --no-cache-dir -r ${APP_HOME}/app/requirements.txt
-
-COPY requirements1.txt .
-RUN pip install --no-cache-dir -r requirements1.txt
+RUN pip install --no-cache-dir -r ${APP_HOME}/requirements.txt
 
 # 确保启动脚本和 supervisord 配置
 COPY launch.sh /app/launch.sh
