@@ -28,8 +28,8 @@ RUN if [ ! -z "${PIP_PACKAGES}" ]; then pip install ${PIP_PACKAGES}; fi
 # 将工作目录设置为 /app
 WORKDIR ${APP_HOME}
 
-# 拉取 gemini-balance 最新代码到当前工作目录 (/app)
-RUN git clone --depth=1 https://github.com/snailyp/gemini-balance.git .
+# 克隆代码到临时目录，然后复制到工作目录以避免 "directory not empty" 错误
+RUN git clone --depth=1 https://github.com/snailyp/gemini-balance.git /tmp/gemini-balance && cp -a /tmp/gemini-balance/. . && rm -rf /tmp/gemini-balance
 
 # 安装 requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
