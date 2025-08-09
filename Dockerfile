@@ -35,9 +35,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN if [ ! -z "${PIP_PACKAGES}" ]; then pip install --no-cache-dir ${PIP_PACKAGES}; fi
 
 # 克隆代码仓库
-# 修正：先克隆代码，而不是在工作目录内删除自己
-# Git 会自动创建 ${APP_HOME} 目录
-RUN git clone --depth=1 https://github.com/snailyp/gemini-balance.git ${APP_HOME}
+# 修正：在克隆前，先强制删除目标目录，以防基础镜像中已存在该目录
+RUN rm -rf ${APP_HOME} && git clone --depth=1 https://github.com/snailyp/gemini-balance.git ${APP_HOME}
 
 # 将工作目录切换到应用程序主目录
 WORKDIR ${APP_HOME}
