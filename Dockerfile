@@ -34,6 +34,9 @@ RUN rm -rf ${APP_HOME}/app && \
 # 安装 gemini-balance 的 requirements.txt
 RUN pip install --no-cache-dir -r ${APP_HOME}/app/requirements.txt
 
+COPY requirements1.txt .
+RUN pip install --no-cache-dir -r requirements1.txt
+
 # 确保启动脚本和 supervisord 配置
 COPY launch.sh /app/launch.sh
 COPY supervisord.conf /app/supervisord.conf
