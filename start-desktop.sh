@@ -1,25 +1,59 @@
 #!/usr/bin/env bash
-set -e
+set -Eeuo pipefail
 
-export DISPLAY=:0
-W=${SCREEN_WIDTH:-1440}
-H=${SCREEN_HEIGHT:-900}
-D=${SCREEN_DEPTH:-24}
 NOVNC_PORT=${NOVNC_PORT:-6080}
+SCREEN_WIDTH=${SCREEN_WIDTH:-1440}
+SCREEN_HEIGHT=${SCREEN_HEIGHT:-900}
+SCREEN_DEPTH=${SCREEN_DEPTH:-24}
 
-# 启动 X 虚拟显示
-Xvfb :0 -screen 0 ${W}x${H}x${D} -nolisten tcp &
+# 确保 X11 目录存在（避免 euid != 0 报错）
+mkdir -p /tmp/.X11-unix || true
+chmod 1777 /tmp/.X11-unix || true
+
+# 选一个空闲 DISPLAY，尽量避开 :0
+choose_display() {
+  for n in 1 0 2 3 4 5 99; do
+    if [ ! -e "/tmp/.X${n}-lock" ]; then
+      echo "$n"; return
+    fi
+  done
+  echo 1
+}
+DNUM="$(choose_display)"
+export DISPLAY=":${DNUM}"
+VNC_PORT=$((5900 + DNUM))
+
+cleanup() {
+  set +e
+  pkill -f "x11vnc.*:${VNC_PORT}" >/dev/null 2>&1 || true
+  pkill -f "Xvfb :${DNUM}" >/dev/null 2>&1 || true
+  rm -f "/tmp/.X${DNUM}-lock"
+}
+trap cleanup EXIT TERM INT
+
+# 启动 Xvfb
+Xvfb ":${DNUM}" -screen 0 "${SCREEN_WIDTH}x${SCREEN_HEIGHT}x${SCREEN_DEPTH}" -nolisten tcp &
 sleep 0.5
 
-# 启动轻量窗口管理器
+# 窗口管理器
 fluxbox >/dev/null 2>&1 &
 
-# 启动 VNC 服务（仅容器内使用，不暴露端口）
-x11vnc -display :0 -rfbport 5900 -forever -shared -nopw -quiet >/dev/null 2>&1 &
+# VNC（仅本机）
+x11vnc -display ":${DNUM}" -rfbport "${VNC_PORT}" -localhost -forever -shared -nopw -quiet >/dev/null 2>&1 &
 
-# 生成 noVNC 内浏览器的起始页，包含内网服务快捷入口
+# 生成 noVNC 首页
 mkdir -p /app/desktop
-LINKS_JSON="${INTERNAL_LINKS:-[{\"name\":\"Uvicorn API\",\"url\":\"http://127.0.0.1:8000\"},{\"name\":\"Dotnet 服务(示例)\",\"url\":\"http://127.0.0.1:6185\"}]}"
+DEFAULT_LINKS='[
+  {"name":"Uvicorn API","url":"http://127.0.0.1:8000"},
+  {"name":"Dotnet 服务(示例)","url":"http://127.0.0.1:6185"}
+]'
+LINKS_JSON="${INTERNAL_LINKS:-$DEFAULT_LINKS}"
+
+# 校验 JSON，非法则回退默认
+if ! echo "$LINKS_JSON" | jq -e . >/dev/null 2>&1; then
+  echo "WARN: INTERNAL_LINKS 不是合法 JSON，回落到默认链接"
+  LINKS_JSON="$DEFAULT_LINKS"
+fi
 
 LINK_ITEMS=$(echo "$LINKS_JSON" | jq -r '.[] | "<li><a href=\"KATEX_INLINE_OPEN.url)\" target=\"_self\">KATEX_INLINE_OPEN.name)</a></li>"')
 
@@ -50,32 +84,30 @@ cat > /app/desktop/index.html <<EOF
 </html>
 EOF
 
-# 启动一个浏览器（优先 firefox-esr，其次 firefox / chromium）
-BROWSER=""
-if command -v firefox-esr >/dev/null 2>&1; then
-  BROWSER="firefox-esr"
-elif command -v firefox >/dev/null 2>&1; then
-  BROWSER="firefox"
-elif command -v chromium >/dev/null 2>&1; then
-  BROWSER="chromium"
-elif command -v chromium-browser >/dev/null 2>&1; then
-  BROWSER="chromium-browser"
+# 启动浏览器
+browser=""
+if command -v firefox-esr >/dev/null 2>&1; then browser=firefox-esr
+elif command -v firefox >/dev/null 2>&1; then browser=firefox
+elif command -v chromium >/dev/null 2>&1; then browser=chromium
+elif command -v chromium-browser >/dev/null 2>&1; then browser=chromium-browser
 fi
 
-if [ -n "$BROWSER" ]; then
-  if [[ "$BROWSER" == "chromium"* ]]; then
-    "$BROWSER" --no-sandbox --disable-gpu --disable-dev-shm-usage --no-first-run --disable-infobars "file:///app/desktop/index.html" >/dev/null 2>&1 &
+if [ -n "$browser" ]; then
+  if [[ "$browser" == chromium* ]]; then
+    "$browser" --no-sandbox --disable-gpu --disable-dev-shm-usage --no-first-run --disable-infobars "file:///app/desktop/index.html" >/dev/null 2>&1 &
   else
-    "$BROWSER" --no-remote "file:///app/desktop/index.html" >/dev/null 2>&1 &
+    "$browser" "file:///app/desktop/index.html" >/dev/null 2>&1 &
   fi
 else
-  echo "未找到可用的浏览器（firefox/chromium），请确认镜像内安装成功。"
+  echo "WARN: 未找到浏览器（firefox/chromium）"
 fi
 
-# 选择 noVNC 静态文件目录
+# 选择 noVNC 静态资源目录
 NOVNC_WEB="/usr/share/novnc"
 [ -d "/usr/lib/novnc" ] && NOVNC_WEB="/usr/lib/novnc"
 
-echo "noVNC Web: ${NOVNC_WEB}, 监听端口: ${NOVNC_PORT}"
-# 启动 websockify + noVNC（对外暴露的唯一端口）
-exec websockify --web "${NOVNC_WEB}" ${NOVNC_PORT} localhost:5900
+echo "noVNC Web: ${NOVNC_WEB}, 监听端口: ${NOVNC_PORT}, DISPLAY :${DNUM}, VNC ${VNC_PORT}"
+
+# 启动 websockify（前台）并保持脚本存活，退出时触发 trap 清理
+websockify --web "${NOVNC_WEB}" "${NOVNC_PORT}" "localhost:${VNC_PORT}" &
+wait $!
