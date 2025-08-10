@@ -24,7 +24,7 @@ RUN apt-get update && apt-get install -y git jq curl ${APT_PACKAGES} && \
     rm -rf /var/lib/apt/lists/*
 
 #安装额外的 pip 包
-RUN if [ ! -z "${PIP_PACKAGES}" ]; then pip install ${PIP_PACKAGES}; fi
+RUN if [ ! -z "${PIP_PACKAGES}" ]; then /app/venv/bin/pip install ${PIP_PACKAGES}; fi
 
 #将工作目录设置为 /app
 WORKDIR ${APP_HOME}
@@ -35,7 +35,7 @@ RUN git clone --depth=1 https://github.com/MoYangking/gemini-balance.git /tmp/ge
 
 #安装 requirements.txt
     rm -rf /tmp/gemini-balance && \
-    pip install --no-cache-dir -r requirements.txt
+    /app/venv/bin/pip install --no-cache-dir -r requirements.txt
 
 #确保启动脚本和 supervisord 配置
     COPY launch.sh /app/launch.sh
