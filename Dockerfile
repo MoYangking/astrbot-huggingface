@@ -1,63 +1,73 @@
 FROM ghcr.io/moyangking/astrbot-lagrange-docker:main
 
-# 仅对外暴露 noVNC 的一个端口
-EXPOSE 6080
+# 只开放一个公网端口（Nginx对外）
+EXPOSE 8000
 
-# 你原有的 ENV（按需保留）
+# 环境变量（可按需覆盖）
 ENV BASE_URL=https://generativelanguage.googleapis.com/v1beta
 ENV TOOLS_CODE_EXECUTION_ENABLED=false
 ENV IMAGE_MODELS='["gemini-2.0-flash"]'
 ENV SEARCH_MODELS='["gemini-2.0-flash"]'
 
-# noVNC/桌面相关（逐行设置；INTERNAL_LINKS 用单键形式）
-ENV NOVNC_PORT 6080
-ENV SCREEN_WIDTH 1440
-ENV SCREEN_HEIGHT 900
-ENV SCREEN_DEPTH 24
-ENV INTERNAL_LINKS [{"name":"Uvicorn API","url":"http://127.0.0.1:8000"},{"name":"Dotnet 服务(示例)","url":"http://127.0.0.1:6185"}]
+# 统一在这里定义内部服务端口，方便改
+# 对外Nginx端口
+ENV PUBLIC_PORT=8000
+# Uvicorn内部端口（从8000改为9000，避免占用对外端口）
+ENV UVICORN_PORT=9000
+# dotnet内部端口（假定是6185，如需变更可覆盖）
+ENV DOTNET_PORT=6185
 
 ARG APP_HOME=/app
+
+# 用于添加额外的apt包（可在构建时传入）
 ARG APT_PACKAGES=""
+# 用于添加额外的pip包（可在构建时传入）
 ARG PIP_PACKAGES=""
 
+# 切换到 root 用户以便安装软件包和使用 pip 安装包
 USER root
 
-# 安装依赖（不使用 Nginx）
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-      git jq curl ca-certificates \
-      novnc websockify x11vnc xvfb fluxbox fonts-dejavu \
-      ${APT_PACKAGES} && \
-    (apt-get install -y --no-install-recommends firefox-esr || \
-     apt-get install -y --no-install-recommends firefox || \
-     apt-get install -y --no-install-recommends chromium || \
-     apt-get install -y --no-install-recommends chromium-browser || true) && \
+# 安装 git、curl、jq、Nginx、envsubst 以及额外 apt 包
+RUN apt-get update && apt-get install -y \
+    git jq curl nginx gettext-base ${APT_PACKAGES} && \
     rm -rf /var/lib/apt/lists/*
 
-# 可选额外 pip
+# 安装额外的 pip 包
 RUN if [ ! -z "${PIP_PACKAGES}" ]; then pip install ${PIP_PACKAGES}; fi
 
+# 将工作目录设置为 /app
 WORKDIR ${APP_HOME}
 
-# 拉取业务代码
+# 克隆代码到临时目录，然后复制到工作目录以避免 "directory not empty" 错误
 RUN git clone --depth=1 https://github.com/MoYangking/gemini-balance.git /tmp/gemini-balance && \
     cp -a /tmp/gemini-balance/. . && rm -rf /tmp/gemini-balance
 
-# 安装 requirements
+# 安装 requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 复制脚本与 supervisor 配置
+# 确保启动脚本和 supervisord 配置
 COPY launch.sh /app/launch.sh
 COPY supervisord.conf /app/supervisord.conf
-COPY start-desktop.sh /app/start-desktop.sh
 
-# 便捷工具
+# 反向代理的 Nginx 模板
+COPY nginx.conf.template /app/nginx.conf.template
+
+# 额外工具
 RUN curl -JLO https://github.com/bincooo/SillyTavern-Docker/releases/download/v1.0.0/git-batch
 
-# 权限 && 换行修正（注意也修 start-desktop.sh 的换行）
-RUN chmod +x /app/launch.sh /app/git-batch /app/start-desktop.sh && \
-    sed -i 's/\r$//' /app/launch.sh && \
-    sed -i 's/\r$//' /app/start-desktop.sh && \
-    chmod -R 777 ${APP_HOME}
+# 确保执行权限
+RUN chmod +x /app/launch.sh && chmod +x /app/git-batch
+
+# 确保目录权限
+RUN chmod -R 777 ${APP_HOME}
+
+# 验证文件存在
+RUN ls -la /app/launch.sh
+
+# 去除 Windows 换行符
+RUN sed -i 's/\r$//' /app/launch.sh
+
+# 将 Nginx 日志打到容器 stdout/stderr（配合我们自定义的nginx.conf也可）
+# 可选：ln -sf /dev/stdout /var/log/nginx/access.log && ln -sf /dev/stderr /var/log/nginx/error.log
 
 CMD ["/usr/bin/supervisord", "-c", "/app/supervisord.conf"]
