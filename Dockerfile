@@ -1,6 +1,6 @@
 FROM ghcr.io/moyangking/astrbot-lagrange-docker:main
 
-# 只开放一个公网端口（Nginx对外）
+# 只开放一个公网端口（Nginx 对外）
 EXPOSE 8000
 
 # 业务环境变量（按需覆盖）
@@ -9,10 +9,12 @@ ENV TOOLS_CODE_EXECUTION_ENABLED=false
 ENV IMAGE_MODELS='["gemini-2.0-flash"]'
 ENV SEARCH_MODELS='["gemini-2.0-flash"]'
 
-# 统一定义内部服务端口，便于通过环境变量覆盖
-ENV PUBLIC_PORT=8000      # 容器内 Nginx 对外端口
-ENV UVICORN_PORT=9000     # Python(Uvicorn) 内部端口
-ENV DOTNET_PORT=6185      # dotnet 内部端口
+# 容器内 Nginx 对外端口
+ENV PUBLIC_PORT=8000
+# Python(Uvicorn) 内部端口
+ENV UVICORN_PORT=9000
+# dotnet 内部端口
+ENV DOTNET_PORT=6185
 
 ARG APP_HOME=/app
 
@@ -46,16 +48,16 @@ COPY launch.sh /app/launch.sh
 COPY supervisord.conf /app/supervisord.conf
 COPY nginx.conf.template /app/nginx.conf.template
 
-# 额外工具（原有）
+# 额外工具
 RUN curl -JLO https://github.com/bincooo/SillyTavern-Docker/releases/download/v1.0.0/git-batch
 
 # 权限
 RUN chmod +x /app/launch.sh && chmod +x /app/git-batch
 RUN chmod -R 777 ${APP_HOME}
 
-# 验证文件存在 + 处理换行
+# 验证文件存在 + 处理换行（防止 CRLF）
 RUN ls -la /app/launch.sh
-RUN sed -i 's/\r$//' /app/launch.sh
+RUN sed -i 's/\r$//' /app/launch.sh /app/supervisord.conf /app/nginx.conf.template
 
 # 以 supervisord 作为入口
 CMD ["/usr/bin/supervisord", "-c", "/app/supervisord.conf"]
