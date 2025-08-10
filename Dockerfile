@@ -3,17 +3,18 @@ FROM ghcr.io/moyangking/astrbot-lagrange-docker:main
 # 仅对外暴露 noVNC 的一个端口
 EXPOSE 6080
 
+# 你原有的 ENV（按需保留）
 ENV BASE_URL=https://generativelanguage.googleapis.com/v1beta
 ENV TOOLS_CODE_EXECUTION_ENABLED=false
 ENV IMAGE_MODELS='["gemini-2.0-flash"]'
 ENV SEARCH_MODELS='["gemini-2.0-flash"]'
 
-# noVNC/桌面相关
-ENV NOVNC_PORT=6080 \
-    SCREEN_WIDTH=1440 \
-    SCREEN_HEIGHT=900 \
-    SCREEN_DEPTH=24 \
-    INTERNAL_LINKS=[{\"name\":\"Uvicorn API\",\"url\":\"http://127.0.0.1:8000\"},{\"name\":\"Dotnet 服务(示例)\",\"url\":\"http://127.0.0.1:6185\"}]
+# noVNC/桌面相关（逐行设置；INTERNAL_LINKS 用“ENV KEY VALUE”形式）
+ENV NOVNC_PORT 6080
+ENV SCREEN_WIDTH 1440
+ENV SCREEN_HEIGHT 900
+ENV SCREEN_DEPTH 24
+ENV INTERNAL_LINKS [{"name":"Uvicorn API","url":"http://127.0.0.1:8000"},{"name":"Dotnet 服务(示例)","url":"http://127.0.0.1:6185"}]
 
 ARG APP_HOME=/app
 ARG APT_PACKAGES=""
@@ -21,7 +22,7 @@ ARG PIP_PACKAGES=""
 
 USER root
 
-# 安装依赖（无 Nginx）
+# 安装依赖（不使用 Nginx）
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       git jq curl ca-certificates \
