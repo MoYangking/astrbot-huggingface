@@ -9,7 +9,7 @@ ENV TOOLS_CODE_EXECUTION_ENABLED=false
 ENV IMAGE_MODELS='["gemini-2.0-flash"]'
 ENV SEARCH_MODELS='["gemini-2.0-flash"]'
 
-# noVNC/桌面相关（逐行设置；INTERNAL_LINKS 用“ENV KEY VALUE”形式）
+# noVNC/桌面相关（逐行设置；INTERNAL_LINKS 用单键形式）
 ENV NOVNC_PORT 6080
 ENV SCREEN_WIDTH 1440
 ENV SCREEN_HEIGHT 900
@@ -54,9 +54,10 @@ COPY start-desktop.sh /app/start-desktop.sh
 # 便捷工具
 RUN curl -JLO https://github.com/bincooo/SillyTavern-Docker/releases/download/v1.0.0/git-batch
 
-# 权限 && 换行修正
+# 权限 && 换行修正（注意也修 start-desktop.sh 的换行）
 RUN chmod +x /app/launch.sh /app/git-batch /app/start-desktop.sh && \
     sed -i 's/\r$//' /app/launch.sh && \
+    sed -i 's/\r$//' /app/start-desktop.sh && \
     chmod -R 777 ${APP_HOME}
 
 CMD ["/usr/bin/supervisord", "-c", "/app/supervisord.conf"]
