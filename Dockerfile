@@ -1,66 +1,57 @@
 FROM ghcr.io/moyangking/astrbot-lagrange-docker:main
 
-# 只开放一个公网端口（Nginx 对外）
+EXPOSE 6185
 EXPOSE 8000
 
-# 业务环境变量（按需覆盖）
 ENV BASE_URL=https://generativelanguage.googleapis.com/v1beta
 ENV TOOLS_CODE_EXECUTION_ENABLED=false
 ENV IMAGE_MODELS='["gemini-2.0-flash"]'
 ENV SEARCH_MODELS='["gemini-2.0-flash"]'
 
-# 容器内 Nginx 对外端口
-ENV PUBLIC_PORT=8000
-# Python(Uvicorn) 内部端口
-ENV UVICORN_PORT=9000
-# dotnet 内部端口
-ENV DOTNET_PORT=6185
-
-# 关键：将 sbin 路径加入 PATH，避免非 root 找不到 nginx
-ENV PATH="/usr/local/sbin:/usr/sbin:/sbin:${PATH}"
-
 ARG APP_HOME=/app
 
-# 构建期可加装额外包
+#用于添加额外的apt包
 ARG APT_PACKAGES=""
+
+#用于添加额外的pip包
 ARG PIP_PACKAGES=""
 
-# root 以便安装
+#切换到 root 用户以便安装软件包和使用 pip 安装包
 USER root
 
-# 安装 git、curl、jq、nginx、envsubst 及额外 apt 包
-RUN apt-get update && apt-get install -y \
-    git jq curl nginx gettext-base ${APT_PACKAGES} && \
+#安装 git、curl、jq 以及额外 apt 包
+RUN apt-get update && apt-get install -y git jq curl ${APT_PACKAGES} && \
     rm -rf /var/lib/apt/lists/*
 
-# 安装额外 pip 包（可选）
+#安装额外的 pip 包
 RUN if [ ! -z "${PIP_PACKAGES}" ]; then pip install ${PIP_PACKAGES}; fi
 
-# 工作目录
+#将工作目录设置为 /app
 WORKDIR ${APP_HOME}
 
-# 拉取项目代码
+#克隆代码到临时目录，然后复制到工作目录以避免 "directory not empty" 错误
 RUN git clone --depth=1 https://github.com/MoYangking/gemini-balance.git /tmp/gemini-balance && \
-    cp -a /tmp/gemini-balance/. . && rm -rf /tmp/gemini-balance
+    cp -a /tmp/gemini-balance/. . && \
 
-# 安装 Python 依赖
-RUN pip install --no-cache-dir -r requirements.txt
+#安装 requirements.txt
+    rm -rf /tmp/gemini-balance && \
+    pip install --no-cache-dir -r requirements.txt
 
-# 放入启动脚本、supervisor 配置、Nginx 模板
-COPY launch.sh /app/launch.sh
-COPY supervisord.conf /app/supervisord.conf
-COPY nginx.conf.template /app/nginx.conf.template
-
-# 额外工具
+#确保启动脚本和 supervisord 配置
+    COPY launch.sh /app/launch.sh
+    COPY supervisord.conf /app/supervisord.conf
 RUN curl -JLO https://github.com/bincooo/SillyTavern-Docker/releases/download/v1.0.0/git-batch
 
-# 权限
+#确保执行权限
 RUN chmod +x /app/launch.sh && chmod +x /app/git-batch
+
+#确保目录权限
 RUN chmod -R 777 ${APP_HOME}
 
-# 验证文件存在 + 处理换行（防止 CRLF）
+#验证文件存在
 RUN ls -la /app/launch.sh
-RUN sed -i 's/\r$//' /app/launch.sh /app/supervisord.conf /app/nginx.conf.template
 
-# 以 supervisord 作为入口
+#去除 Windows 换行符
+RUN sed -i 's/\r$//' /app/launch.sh
+
 CMD ["/usr/bin/supervisord", "-c", "/app/supervisord.conf"]
