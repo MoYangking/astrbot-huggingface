@@ -16,6 +16,9 @@ ENV UVICORN_PORT=9000
 # dotnet 内部端口
 ENV DOTNET_PORT=6185
 
+# 关键：将 sbin 路径加入 PATH，避免非 root 找不到 nginx
+ENV PATH="/usr/local/sbin:/usr/sbin:/sbin:${PATH}"
+
 ARG APP_HOME=/app
 
 # 构建期可加装额外包
