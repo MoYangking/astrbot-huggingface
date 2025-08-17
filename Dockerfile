@@ -30,7 +30,7 @@ RUN if [ ! -z "${PIP_PACKAGES}" ]; then /app/venv/bin/pip install ${PIP_PACKAGES
 WORKDIR ${APP_HOME}
 
 #克隆代码到临时目录，然后复制到工作目录以避免 "directory not empty" 错误
-RUN git clone --depth=1 https://github.com/MoYangking/gemini-balance.git /tmp/gemini-balance && \
+RUN git clone --depth=1 https://github.com/snailyp/gemini-balance.git /tmp/gemini-balance && \
     cp -a /tmp/gemini-balance/. . && \
 
 #安装 requirements.txt
