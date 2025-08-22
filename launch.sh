@@ -95,20 +95,18 @@ load_env() {
     local sec_esc proj_esc
     sec_esc="$(sed_escape "${github_secret:-}")"
     proj_esc="$(sed_escape "${github_project:-}")"
-    sed -i "s/\[github_secret\]/${sec_esc}/g" "${BASE}/launch.sh" || true
-    sed -i "s#\[github_project\]#${proj_esc}#g" "${BASE}/launch.sh" || true
+    sed -i "s/$$github_secret$$/${sec_esc}/g" "${BASE}/launch.sh" || true
+    sed -i "s#$$github_project$$#${proj_esc}#g" "${BASE}/launch.sh" || true
   fi
 }
 
 # ---------- Git ----------
 git_sanitize_repo() {
   local dir="${BASE}/history"
-  # 终止未完成操作
   git -C "$dir" rebase --abort >/dev/null 2>&1 || true
   git -C "$dir" merge --abort >/dev/null 2>&1 || true
   git -C "$dir" cherry-pick --abort >/dev/null 2>&1 || true
   rm -rf "$dir/.git/rebase-merge" "$dir/.git/REBASE_HEAD" "$dir/.git/REBASE_APPLY" >/dev/null 2>&1 || true
-  # 确保在 main 分支而不是 detached HEAD
   local cur; cur="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
   if [ "$cur" != "main" ]; then git -C "$dir" checkout -B main >/dev/null 2>&1 || true; fi
 }
@@ -472,7 +470,7 @@ hydrate_one_pointer() {
 
           mv -f "$tmp" "$dst"; chmod 0644 "$dst" || true
 
-          # 更新指针为“最新 asset”（全部用字符串参数 + tonumber?）
+          # 更新指针为“最新 asset”
           local tmp_ptr; tmp_ptr="$(mktemp)"
           jq -nc \
             --arg repo "$repo_fallback" \
@@ -609,25 +607,25 @@ commit_and_push() {
   fi
 
   if git -C "$dir" remote | grep -q '^origin$'; then
-    local attempt
+    local pushed=0 attempt
     for attempt in 1 2 3; do
       git -C "$dir" fetch origin main || true
-      # 先同步远端到本地（自动暂存）再推
       if ! git -C "$dir" pull --rebase --autostash origin main; then
         git -C "$dir" rebase --abort >/dev/null 2>&1 || true
         LOG "pull --rebase 失败（第${attempt}次），继续重试"
       fi
       if git -C "$dir" push -u origin main; then
         LOG "推送成功（第${attempt}次）"
+        pushed=1
         break
       else
         LOG "推送被拒绝，准备重试（第${attempt}次）"
         sleep 1
       fi
     done
-    if [ "$attempt" = "3" ]; then
+    if [ "$pushed" -ne 1 ]; then
       ERR "多次重试仍无法推送，已保留本地提交，等待下轮重试"
-    end
+    fi
   fi
 
   flock -u "$lockfd" || true
