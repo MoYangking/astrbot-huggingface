@@ -51,7 +51,6 @@ file_mtime() {
   [ -f "$f" ] || { echo 0; return 1; }
   if stat -c %Y "$f" >/dev/null 2>&1; then stat -c %Y "$f"; return 0; fi
   if stat -f %m "$f" >/dev/null 2>&1; then stat -f %m "$f"; return 0; fi
-  # 取当前时间兜底
   date +%s
 }
 now_ts() { date +%s; }
@@ -60,7 +59,7 @@ STATE="${BASE}/history/.pointer_scan_state.json"
 state_init() {
   if [ ! -f "$STATE" ]; then echo '{"paths":{}}' > "$STATE"; fi
   if ! jq -e 'has("paths")' "$STATE" >/dev/null 2>&1; then
-    tmp="$(mktemp)"; jq '{paths:.}' "$STATE" > "$tmp" && mv -f "$tmp" "$STATE"
+    local tmp; tmp="$(mktemp)"; jq '{paths:.}' "$STATE" > "$tmp" && mv -f "$tmp" "$STATE"
   fi
 }
 state_get() { # arg: rel field -> value
@@ -195,7 +194,7 @@ gh_delete_asset() {
   local code; code="$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE -H "Authorization: Bearer ${github_secret}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${github_project}/releases/assets/${asset_id}")"
   [ "$code" = "204" ] && LOG "已删除旧 asset: ${asset_id}" || LOG "删除旧 asset 失败(code=$code)，忽略"
 }
-# 在指定 tag 中寻找 basename 对应的“最新” asset
+# 在指定 tag 中寻找 basename 对应的“最新” asset（名称形如 64sha-basename）
 find_latest_asset() {
   local repo="$1" tag="$2" basename="$3"
   local res; res="$(curl -sS ${github_secret:+-H "Authorization: Bearer ${github_secret}"} -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${repo}/releases/tags/${tag}")" || return 1
@@ -249,8 +248,11 @@ process_large_file() {
   local changed_on_disk="false"
   { [ "$mtime" != "$last_mtime" ] || [ "$size" != "$last_size" ]; } && changed_on_disk="true"
 
+  # 修复这里的算术错误：先展开默认值，再做运算
+  local lc; lc="${last_check:-0}"
+  # 需要检查？首次/磁盘变更/间隔已到
   local should_check="false"
-  if [ ! -f "$pointer" ] || [ "$changed_on_disk" = "true" ] || [ $(( now - (last_check:-0) )) -ge "$SCAN_INTERVAL_SECS" ]; then
+  if [ ! -f "$pointer" ] || [ "$changed_on_disk" = "true" ] || (( now - lc >= SCAN_INTERVAL_SECS )); then
     should_check="true"
   fi
   [ "$should_check" != "true" ] && return 0
@@ -290,7 +292,7 @@ process_large_file() {
     fi
 
     # 只有上传成功才更新指针与清理旧 asset
-    if [ "$upload_ok" = "true" ]; then
+    if [ "$upload_ok" = "true" ] && [ -n "$new_asset_id" ] && [ "$new_asset_id" != "null" ]; then
       # 删除旧 asset（可选）
       if [ -f "$pointer" ] && [ "${KEEP_OLD_ASSETS}" != "true" ] && [ -n "${github_secret:-}" ] && [ -n "${github_project:-}" ]; then
         local old_asset_id; old_asset_id="$(jq -r '.asset_id // empty' "$pointer" 2>/dev/null || true)"
@@ -442,7 +444,7 @@ hydrate_one_pointer() {
             ERR "回退下载失败：$rel_path"; rm -f "$tmp" 2>/dev/null || true; return 1
           fi
 
-          # 用回退 asset 的信息校验并原子更新指针（注意：与老指针 sha/size 可能不同）
+          # 用回退 asset 的信息校验并原子更新指针
           local got_size; got_size="$(file_size "$tmp" || echo 0)"
           if [ -n "$size2" ] && [ "$size2" != "null" ] && [ "$got_size" != "$size2" ]; then
             ERR "回退下载大小不匹配，期望 $size2 实际 $got_size: $rel_path"; rm -f "$tmp"; return 1
@@ -452,7 +454,6 @@ hydrate_one_pointer() {
             if [ "$got_sha" != "$sha2" ]; then ERR "回退下载 SHA 不匹配，期望 $sha2 实际 $got_sha: $rel_path"; rm -f "$tmp"; return 1; fi
           fi
 
-          # 原子写目标文件
           mv -f "$tmp" "$dst"; chmod 0644 "$dst" || true
 
           # 更新指针为“最新 asset”
@@ -479,7 +480,6 @@ hydrate_one_pointer() {
       fi
     fi
 
-    # 没有任何回退可用
     ERR "未找到可下载的 asset：$rel_path"
     return 1
   fi
