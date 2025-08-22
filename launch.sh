@@ -5,73 +5,57 @@ set -Eeuo pipefail
 BASE="${BASE:-$PWD}"
 BASE="$(cd "$BASE" && pwd)"
 
-# 需要管理的目标（相对 BASE）
-TARGETS="appsettings.json data device.json keystore.json lagrange-0-db qr-0.png"
+# 管理的目标（相对 BASE，支持目录）
+TARGETS="${TARGETS:-appsettings.json data device.json keystore.json lagrange-0-db qr-0.png}"
 
 # 阈值/行为配置
 LARGE_THRESHOLD="${LARGE_THRESHOLD:-52428800}"   # 50MB
 RELEASE_TAG="${RELEASE_TAG:-blobs}"
 KEEP_OLD_ASSETS="${KEEP_OLD_ASSETS:-false}"
-STICKY_POINTER="${STICKY_POINTER:-true}"
+STICKY_POINTER="${STICKY_POINTER:-true}"         # 已指针化则保持指针模式
 VERIFY_SHA="${VERIFY_SHA:-true}"
 DOWNLOAD_RETRY="${DOWNLOAD_RETRY:-3}"
 
-# 等待全部下载完成的策略
-HYDRATE_CHECK_INTERVAL="${HYDRATE_CHECK_INTERVAL:-3}"  # 每次检查间隔秒
-HYDRATE_TIMEOUT="${HYDRATE_TIMEOUT:-0}"                # 0 表示无限等待
-AFTER_SYNC_CMD="${AFTER_SYNC_CMD:-}"                   # 全部完成后要执行的命令（可选）
+# 阻塞等待策略
+HYDRATE_CHECK_INTERVAL="${HYDRATE_CHECK_INTERVAL:-3}"
+HYDRATE_TIMEOUT="${HYDRATE_TIMEOUT:-0}"          # 0 表示无限等
+AFTER_SYNC_CMD="${AFTER_SYNC_CMD:-}"             # 可选：就绪后执行
 
-# 设置可写 HOME，修复 //.gitconfig 权限问题（HF 某些镜像 HOME 为空）
+# 修复 //.gitconfig 权限问题（HF 某些镜像 HOME 为空）
 export HOME="${HOME:-${BASE}/.home}"
 mkdir -p "$HOME" >/dev/null 2>&1 || true
 
 LOG() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
 ERR() { printf '[%s] ERROR: %s\n' "$(date '+%F %T')" "$*" >&2; }
 
+trap 'ERR "launch.sh 进程收到信号或异常退出（$?）"' EXIT
+
+# --------- 小工具 ---------
 sed_escape() { printf '%s' "$1" | sed -e 's/[\/&]/\\&/g'; }
-
-urlencode() {
-  local str="$1" out="" c
-  for (( i=0; i<${#str}; i++ )); do
-    c=${str:$i:1}
-    case "$c" in
-      [a-zA-Z0-9._~-]) out+="$c" ;;
-      ' ') out+="%20" ;;
-      *) printf -v hex '%02X' "'$c"; out+="%$hex" ;;
-    esac
-  done
-  printf '%s' "$out"
-}
-
-sha256_of() {
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | awk '{print $1}'
-  else
-    shasum -a 256 "$1" | awk '{print $1}'
-  fi
-}
-
+urlencode() { local str="$1" out="" c; for ((i=0;i<${#str};i++)); do c=${str:$i:1}; case "$c" in [a-zA-Z0-9._~-]) out+="$c";; ' ') out+="%20";; *) printf -v hex '%02X' "'$c"; out+="%$hex";; esac; done; printf '%s' "$out"; }
+sha256_of() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
 file_size() { stat -c %s "$1" 2>/dev/null || stat -f %z "$1"; }
 
+# --------- ENV 加载 ---------
 load_env() {
   if [ -n "${fetch:-}" ]; then
     LOG '远程获取参数...'
     curl -fsSL "$fetch" -o "${BASE}/data.json"
-    export github_secret
-    export github_project
+    export github_secret github_project
     github_secret="$(jq -r '.github_secret // empty' "${BASE}/data.json")"
     github_project="$(jq -r '.github_project // empty' "${BASE}/data.json")"
   fi
-
+  # 保持兼容：若有占位符，替换掉（当前脚本没有占位符，调用也无副作用）
   if [ -f "${BASE}/launch.sh" ]; then
     local sec_esc proj_esc
     sec_esc="$(sed_escape "${github_secret:-}")"
     proj_esc="$(sed_escape "${github_project:-}")"
-    sed -i "s/\[github_secret\]/${sec_esc}/g" "${BASE}/launch.sh"
-    sed -i "s#\[github_project\]#${proj_esc}#g" "${BASE}/launch.sh"
+    sed -i "s/\[github_secret\]/${sec_esc}/g" "${BASE}/launch.sh" || true
+    sed -i "s#\[github_project\]#${proj_esc}#g" "${BASE}/launch.sh" || true
   fi
 }
 
+# --------- Git 仓库 ---------
 ensure_repo() {
   mkdir -p "${BASE}/history"
   git config --global --add safe.directory "${BASE}/history" >/dev/null 2>&1 || true
@@ -126,31 +110,25 @@ ensure_repo() {
   fi
 }
 
+# --------- 链接/目标 ---------
 link_targets() {
   for target in $TARGETS; do
     local src="${BASE}/${target}"
     local dst="${BASE}/history/${target}"
-    local dst_dir; dst_dir="$(dirname "${dst}")"
-    mkdir -p "${dst_dir}"
+    mkdir -p "$(dirname "${dst}")"
 
     if [ -e "${src}" ] && [ ! -L "${src}" ]; then
       LOG "初始化目标: ${target}"
       mv -f "${src}" "${dst}"
     fi
-
     if [ -e "${dst}" ]; then
       if [ -L "${src}" ]; then
         local real; real="$(readlink -f "${src}" || true)"
-        if [ "${real}" != "$(readlink -f "${dst}")" ]; then
-          ln -sfn "${dst}" "${src}"
-        fi
-      elif [ ! -e "${src}" ]; then
-        ln -s "${dst}" "${src}"
-      fi
+        if [ "${real}" != "$(readlink -f "${dst}")" ]; then ln -sfn "${dst}" "${src}"; fi
+      elif [ ! -e "${src}" ]; then ln -s "${dst}" "${src}"; fi
     fi
   done
 }
-
 process_target() {
   local target="$1"
   if [ -e "${BASE}/${target}" ] && [ ! -L "${BASE}/${target}" ]; then
@@ -160,32 +138,23 @@ process_target() {
     ln -s "${BASE}/history/${target}" "${BASE}/${target}"
   fi
 }
-
 ensure_gitignore_entry() {
-  local rel="$1"
-  local gi="${BASE}/history/.gitignore"
-  touch "$gi"
-  if ! grep -Fxq -- "$rel" "$gi"; then
-    echo "$rel" >> "$gi"
-  fi
+  local rel="$1"; local gi="${BASE}/history/.gitignore"
+  touch "$gi"; grep -Fxq -- "$rel" "$gi" || echo "$rel" >> "$gi"
 }
 
+# --------- GitHub Release API ---------
 gh_ensure_release() {
   if [ -z "${github_secret:-}" ] || [ -z "${github_project:-}" ]; then
     echo "缺少 github_secret 或 github_project，无法使用 releases" >&2
     return 1
   fi
-  local api="https://api.github.com"
-  local tmp; tmp="$(mktemp)"
+  local api="https://api.github.com"; local tmp; tmp="$(mktemp)"
   local code
   code="$(curl -sS -o "$tmp" -w '%{http_code}' \
     -H "Authorization: Bearer ${github_secret}" -H "Accept: application/vnd.github+json" \
     "${api}/repos/${github_project}/releases/tags/${RELEASE_TAG}")"
-  if [ "$code" = "200" ]; then
-    jq -r '.id // empty' "$tmp"
-    rm -f "$tmp"
-    return 0
-  fi
+  if [ "$code" = "200" ]; then jq -r '.id // empty' "$tmp"; rm -f "$tmp"; return 0; fi
   rm -f "$tmp"
   local payload
   payload="$(jq -nc --arg tag "$RELEASE_TAG" --arg name "$RELEASE_TAG" \
@@ -195,13 +164,9 @@ gh_ensure_release() {
       -H "Accept: application/vnd.github+json" -H "Content-Type: application/json" \
       -d "$payload" "${api}/repos/${github_project}/releases")"
   rid="$(echo "$res" | jq -r '.id // empty')"
-  if [ -z "$rid" ] || [ "$rid" = "null" ]; then
-    echo "创建 release 失败：$res" >&2
-    return 1
-  fi
-  echo "$rid"
+  [ -n "$rid" ] && [ "$rid" != "null" ] && echo "$rid" && return 0
+  echo "创建 release 失败：$res" >&2; return 1
 }
-
 gh_upload_asset() {
   local release_id="$1" file="$2" name="$3"
   curl -sS -X POST -H "Authorization: Bearer ${github_secret}" \
@@ -209,42 +174,34 @@ gh_upload_asset() {
     --data-binary @"$file" \
     "https://uploads.github.com/repos/${github_project}/releases/${release_id}/assets?name=$(urlencode "$name")"
 }
-
 gh_delete_asset() {
   local asset_id="$1"
   local code
   code="$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE \
-    -H "Authorization: Bearer ${github_secret}" \
-    -H "Accept: application/vnd.github+json" \
+    -H "Authorization: Bearer ${github_secret}" -H "Accept: application/vnd.github+json" \
     "https://api.github.com/repos/${github_project}/releases/assets/${asset_id}")"
-  if [ "$code" = "204" ]; then
-    LOG "已删除旧 asset: ${asset_id}"
-  else
-    LOG "删除旧 asset 失败(code=$code)，忽略"
-  fi
+  [ "$code" = "204" ] && LOG "已删除旧 asset: ${asset_id}" || LOG "删除旧 asset 失败(code=$code)，忽略"
 }
 
+# --------- 指针化/上传逻辑（修复“更新不上传”） ---------
 process_large_file() {
   local release_id="$1" f="$2"
   [ -f "$f" ] || return 0
 
   local rel="${f#${BASE}/history/}"
   local pointer="${f}.pointer"
-
   local size; size="$(file_size "$f")"
 
-  # 小文件：根据策略撤销指针化
-  if [ "$size" -le "$LARGE_THRESHOLD" ]; then
-    if [ "${STICKY_POINTER}" = "true" ] && [ -f "$pointer" ]; then
-      ensure_gitignore_entry "$rel"
-      if git -C "${BASE}/history" ls-files --error-unmatch "$rel" >/dev/null 2>&1; then
-        git -C "${BASE}/history" rm --cached -f "$rel" || true
-      fi
-      git -C "${BASE}/history" add -f "$pointer" || true
-      return 0
-    fi
+  # 指针模式：大于阈值；或 STICKY_POINTER=true 且存在指针（即便现在小于阈值）
+  local pointer_mode="false"
+  if [ "$size" -gt "$LARGE_THRESHOLD" ] || { [ "$STICKY_POINTER" = "true" ] && [ -f "$pointer" ]; }; then
+    pointer_mode="true"
+  fi
+
+  if [ "$pointer_mode" != "true" ]; then
+    # 真实文件模式：撤销指针
     if [ -f "$pointer" ]; then
-      LOG "文件降到阈值以下，撤销指针化: ${rel}"
+      LOG "撤销指针化：${rel}（当前大小 ${size}）"
       git -C "${BASE}/history" rm -f --cached "${rel}" >/dev/null 2>&1 || true
       git -C "${BASE}/history" add -f "${rel}" || true
       git -C "${BASE}/history" rm -f --cached "${rel}.pointer" >/dev/null 2>&1 || true
@@ -253,56 +210,52 @@ process_large_file() {
     return 0
   fi
 
-  # 大文件：指针化
+  # 指针模式：始终比对 sha，有变就上传
   local sha; sha="$(sha256_of "$f")"
+  local old_sha=""; [ -f "$pointer" ] && old_sha="$(jq -r '.sha256 // empty' "$pointer" 2>/dev/null || true)"
 
-  if [ -f "$pointer" ]; then
-    local old_sha; old_sha="$(jq -r '.sha256 // empty' "$pointer" 2>/dev/null || true)"
-    if [ "$old_sha" = "$sha" ] && [ -n "$old_sha" ]; then
-      ensure_gitignore_entry "$rel"
-      if git -C "${BASE}/history" ls-files --error-unmatch "$rel" >/dev/null 2>&1; then
-        git -C "${BASE}/history" rm --cached -f "$rel" || true
-      fi
-      git -C "${BASE}/history" add -f "$pointer" || true
-      return 0
-    fi
-  fi
+  local need_upload="false"
+  if [ ! -f "$pointer" ] || [ "$old_sha" != "$sha" ]; then need_upload="true"; fi
 
   local base asset_name resp dl new_asset_id
   base="$(basename "$f")"
   asset_name="${sha}-${base}"
   dl=""; new_asset_id=""
 
-  local release_id_local="$release_id"
-  if [ -z "$release_id_local" ] && [ -n "${github_project:-}" ] && [ -n "${github_secret:-}" ]; then
-    release_id_local="$(gh_ensure_release || echo "")"
-  fi
+  if [ "$need_upload" = "true" ]; then
+    local rid="$release_id"
+    if [ -z "$rid" ] && [ -n "${github_project:-}" ] && [ -n "${github_secret:-}" ]; then
+      rid="$(gh_ensure_release || echo "")"
+    fi
+    if [ -n "$rid" ]; then
+      LOG "上传大文件到 release: ${rel} (${size} bytes, sha=${sha:0:8}...)"
+      resp="$(gh_upload_asset "$rid" "$f" "$asset_name" || true)"
+      dl="$(echo "$resp" | jq -r '.browser_download_url // empty')"
+      new_asset_id="$(echo "$resp" | jq -r '.id // empty')"
+      # 兜底：同名已存在时查询
+      if { [ -z "$dl" ] || [ "$dl" = "null" ]; } && [ -n "${github_project:-}" ]; then
+        local res2
+        res2="$(curl -sS -H "Authorization: Bearer ${github_secret}" -H "Accept: application/vnd.github+json" \
+          "https://api.github.com/repos/${github_project}/releases/${rid}/assets?per_page=100")"
+        new_asset_id="$(echo "$res2" | jq -r --arg n "$asset_name" '.[]?|select(.name==$n).id // empty')"
+        dl="$(echo "$res2" | jq -r --arg n "$asset_name" '.[]?|select(.name==$n).browser_download_url // empty')"
+      fi
+    else
+      LOG "未配置 GitHub 凭据或 release 不可用，仍将写入指针（无下载链接）"
+    fi
 
-  if [ -n "$release_id_local" ]; then
-    LOG "上传大文件到 release: ${rel} (${size} bytes)"
-    resp="$(gh_upload_asset "$release_id_local" "$f" "$asset_name" || true)"
-    dl="$(echo "$resp" | jq -r '.browser_download_url // empty')"
-    new_asset_id="$(echo "$resp" | jq -r '.id // empty')"
-    # 若同名存在，查询已有 asset
-    if { [ -z "$dl" ] || [ "$dl" = "null" ]; } && [ -n "${github_project:-}" ]; then
-      local res2
-      res2="$(curl -sS -H "Authorization: Bearer ${github_secret}" -H "Accept: application/vnd.github+json" \
-        "https://api.github.com/repos/${github_project}/releases/${release_id_local}/assets?per_page=100")"
-      new_asset_id="$(echo "$res2" | jq -r --arg n "$asset_name" '.[]?|select(.name==$n).id // empty')"
-      dl="$(echo "$res2" | jq -r --arg n "$asset_name" '.[]?|select(.name==$n).browser_download_url // empty')"
+    # 删除旧 asset（按配置）
+    if [ -f "$pointer" ] && [ "${KEEP_OLD_ASSETS}" != "true" ] && [ -n "${github_secret:-}" ] && [ -n "${github_project:-}" ]; then
+      local old_asset_id; old_asset_id="$(jq -r '.asset_id // empty' "$pointer" 2>/dev/null || true)"
+      [ -n "$old_asset_id" ] && [ "$old_asset_id" != "null" ] && gh_delete_asset "$old_asset_id" || true
     fi
   else
-    LOG "未配置 GitHub 凭据或创建 release 失败，跳过上传，仅写指针（无下载链接）"
+    # 无需上传但也要确保指针与忽略状态
+    dl="$(jq -r '.download_url // empty' "$pointer" 2>/dev/null || true)"
+    new_asset_id="$(jq -r '.asset_id // empty' "$pointer" 2>/dev/null || true)"
   fi
 
-  if [ -f "$pointer" ] && [ "${KEEP_OLD_ASSETS}" != "true" ] && [ -n "${github_secret:-}" ] && [ -n "${github_project:-}" ]; then
-    local old_asset_id
-    old_asset_id="$(jq -r '.asset_id // empty' "$pointer" 2>/dev/null || true)"
-    if [ -n "$old_asset_id" ] && [ "$old_asset_id" != "null" ]; then
-      gh_delete_asset "$old_asset_id" || true
-    fi
-  fi
-
+  # 写指针
   jq -nc \
     --arg repo "${github_project:-}" \
     --arg tag "$RELEASE_TAG" \
@@ -337,24 +290,20 @@ pointerize_large_files() {
   if [ -n "${github_project:-}" ] && [ -n "${github_secret:-}" ]; then
     release_id="$(gh_ensure_release || echo "")"
   fi
-
   for target in $TARGETS; do
     local root="${BASE}/history/${target}"
     if [ -d "$root" ]; then
       find "$root" -type f ! -name '*.pointer' ! -path '*/.git/*' -print0 2>/dev/null \
-        | while IFS= read -r -d '' f; do
-            process_large_file "$release_id" "$f" || true
-          done
+        | while IFS= read -r -d '' f; do process_large_file "$release_id" "$f" || true; done
     elif [ -f "$root" ]; then
       process_large_file "$release_id" "$root" || true
     fi
   done
 }
 
+# --------- 指针 -> 本地文件 ---------
 hydrate_one_pointer() {
-  local ptr="$1"
-  [ -f "$ptr" ] || return 0
-
+  local ptr="$1"; [ -f "$ptr" ] || return 0
   local repo tag asset_name asset_id url sha size rel_path
   repo="$(jq -r '.repo // empty' "$ptr")"
   tag="$(jq -r '.release_tag // empty' "$ptr")"
@@ -364,15 +313,10 @@ hydrate_one_pointer() {
   sha="$(jq -r '.sha256 // empty' "$ptr")"
   size="$(jq -r '.size // 0' "$ptr")"
   rel_path="$(jq -r '.original_path // empty' "$ptr")"
-
-  if [ -z "$rel_path" ]; then
-    ERR "pointer 缺少 original_path: $ptr"
-    return 1
-  fi
+  [ -n "$rel_path" ] || { ERR "pointer 缺少 original_path: $ptr"; return 1; }
 
   local dst="${BASE}/history/${rel_path}"
-  local dst_dir; dst_dir="$(dirname "$dst")"
-  mkdir -p "$dst_dir"
+  mkdir -p "$(dirname "$dst")"
   ensure_gitignore_entry "$rel_path"
 
   # 已存在且匹配，跳过
@@ -381,29 +325,23 @@ hydrate_one_pointer() {
     if [ "$cur_size" = "$size" ]; then
       if [ "${VERIFY_SHA}" = "true" ] && [ -n "$sha" ]; then
         local cur_sha; cur_sha="$(sha256_of "$dst")"
-        if [ "$cur_sha" = "$sha" ]; then
-          return 0
-        fi
+        [ "$cur_sha" = "$sha" ] && return 0
       else
         return 0
       fi
     fi
   fi
 
-  # 解析下载 URL
+  # 下载 URL 选择
   local dl_url="" ; local -a headers=()
   if [ -n "$asset_id" ] && [ "$asset_id" != "null" ] && [ -n "${github_secret:-}" ] && [ -n "$repo" ]; then
     dl_url="https://api.github.com/repos/${repo}/releases/assets/${asset_id}"
     headers=(-H "Authorization: Bearer ${github_secret}" -H "Accept: application/octet-stream")
   elif [ -n "$url" ] && [ "$url" != "null" ]; then
-    dl_url="$url"
-    if [ -n "${github_secret:-}" ]; then
-      headers=(-H "Authorization: Bearer ${github_secret}")
-    fi
+    dl_url="$url"; [ -n "${github_secret:-}" ] && headers=(-H "Authorization: Bearer ${github_secret}")
   elif [ -n "$repo" ] && [ -n "$tag" ] && [ -n "$asset_name" ]; then
     local res aid burl
-    res="$(curl -sS ${github_secret:+-H "Authorization: Bearer ${github_secret}"} \
-           -H "Accept: application/vnd.github+json" \
+    res="$(curl -sS ${github_secret:+-H "Authorization: Bearer ${github_secret}"} -H "Accept: application/vnd.github+json" \
            "https://api.github.com/repos/${repo}/releases/tags/${tag}")"
     aid="$(echo "$res" | jq -r --arg n "$asset_name" '.assets[]?|select(.name==$n).id // empty')"
     burl="$(echo "$res" | jq -r --arg n "$asset_name" '.assets[]?|select(.name==$n).browser_download_url // empty')"
@@ -411,67 +349,47 @@ hydrate_one_pointer() {
       dl_url="https://api.github.com/repos/${repo}/releases/assets/${aid}"
       headers=(-H "Authorization: Bearer ${github_secret}" -H "Accept: application/octet-stream")
     elif [ -n "$burl" ]; then
-      dl_url="$burl"
-      if [ -n "${github_secret:-}" ]; then
-        headers=(-H "Authorization: Bearer ${github_secret}")
-      fi
+      dl_url="$burl"; [ -n "${github_secret:-}" ] && headers=(-H "Authorization: Bearer ${github_secret}")
     else
-      ERR "未找到可下载的 asset: $repo $tag $asset_name"
-      return 1
+      ERR "未找到可下载的 asset: $repo $tag $asset_name"; return 1
     fi
   else
-    ERR "pointer 信息不足，无法下载: $ptr"
-    return 1
+    ERR "pointer 信息不足，无法下载: $ptr"; return 1
   fi
 
   LOG "下载大文件到本地: $rel_path"
   local tmp="${dst}.part"
   if [ -f "$tmp" ]; then
-    curl -fL --retry "${DOWNLOAD_RETRY}" --retry-delay 2 -C - \
-      "${headers[@]}" -o "$tmp" "$dl_url"
+    curl -fL --retry "${DOWNLOAD_RETRY}" --retry-delay 2 -C - "${headers[@]}" -o "$tmp" "$dl_url"
   else
-    curl -fL --retry "${DOWNLOAD_RETRY}" --retry-delay 2 \
-      "${headers[@]}" -o "$tmp" "$dl_url"
+    curl -fL --retry "${DOWNLOAD_RETRY}" --retry-delay 2 "${headers[@]}" -o "$tmp" "$dl_url"
   fi
 
   # 校验
   local got_size; got_size="$(file_size "$tmp")"
-  if [ -n "$size" ] && [ "$size" != "0" ] && [ "$got_size" != "$size" ]; then
-    ERR "大小不匹配，期望 $size 实际 $got_size: $rel_path"
-    return 1
-  fi
+  if [ -n "$size" ] && [ "$size" != "0" ] && [ "$got_size" != "$size" ]; then ERR "大小不匹配，期望 $size 实际 $got_size: $rel_path"; return 1; fi
   if [ "${VERIFY_SHA}" = "true" ] && [ -n "$sha" ]; then
     local got_sha; got_sha="$(sha256_of "$tmp")"
-    if [ "$got_sha" != "$sha" ]; then
-      ERR "SHA 不匹配，期望 $sha 实际 $got_sha: $rel_path"
-      return 1
-    fi
+    if [ "$got_sha" != "$sha" ]; then ERR "SHA 不匹配，期望 $sha 实际 $got_sha: $rel_path"; return 1; fi
   fi
 
-  mv -f "$tmp" "$dst"
-  chmod 0644 "$dst" || true
+  mv -f "$tmp" "$dst"; chmod 0644 "$dst" || true
 }
-
 hydrate_from_pointers() {
-  local count=0
   for target in $TARGETS; do
     local root="${BASE}/history/${target}"
     if [ -d "$root" ]; then
       find "$root" -type f -name '*.pointer' -print0 2>/dev/null \
-        | while IFS= read -r -d '' p; do
-            hydrate_one_pointer "$p" || true
-          done
+        | while IFS= read -r -d '' p; do hydrate_one_pointer "$p" || true; done
     elif [ -f "${root}.pointer" ]; then
       hydrate_one_pointer "${root}.pointer" || true
     fi
   done
 }
 
-# 判断是否“全部就绪”：所有 .pointer 对应的大文件本地存在且校验通过
+# --------- 就绪判断/阻塞等待 ---------
 all_pointers_hydrated() {
-  local total=0 ok=0
-  local missing_list=""
-
+  local total=0 ok=0 missing=""
   for target in $TARGETS; do
     local root="${BASE}/history/${target}"
     if [ -d "$root" ]; then
@@ -483,103 +401,53 @@ all_pointers_hydrated() {
         size="$(jq -r '.size // 0' "$p")"
         sha="$(jq -r '.sha256 // empty' "$p")"
         if [ -f "$dst" ]; then
-          local cur_size; cur_size="$(file_size "$dst")"
-          if [ "$cur_size" = "$size" ]; then
+          local cs; cs="$(file_size "$dst")"
+          if [ "$cs" = "$size" ]; then
             if [ "${VERIFY_SHA}" = "true" ] && [ -n "$sha" ]; then
-              local cur_sha; cur_sha="$(sha256_of "$dst")"
-              if [ "$cur_sha" = "$sha" ]; then
-                ok=$((ok+1))
-              else
-                missing_list+=$'\n'"- ${rel} (SHA 不匹配)"
-              fi
-            else
-              ok=$((ok+1))
-            fi
-          else
-            missing_list+=$'\n'"- ${rel} (大小不匹配)"
-          fi
-        else
-          missing_list+=$'\n'"- ${rel} (缺失)"
-        fi
+              local csha; csha="$(sha256_of "$dst")"
+              [ "$csha" = "$sha" ] && ok=$((ok+1)) || missing+=$'\n'"- ${rel} (SHA 不匹配)"
+            else ok=$((ok+1)); fi
+          else missing+=$'\n'"- ${rel} (大小不匹配)"; fi
+        else missing+=$'\n'"- ${rel} (缺失)"; fi
       done < <(find "$root" -type f -name '*.pointer' -print0 2>/dev/null)
     elif [ -f "${root}.pointer" ]; then
-      total=$((total+1))
-      local p="${root}.pointer" rel dst size sha
+      total=$((total+1)); local p="${root}.pointer" rel dst size sha
       rel="$(jq -r '.original_path // empty' "$p")"
       dst="${BASE}/history/${rel}"
       size="$(jq -r '.size // 0' "$p")"
       sha="$(jq -r '.sha256 // empty' "$p")"
       if [ -f "$dst" ]; then
-        local cur_size; cur_size="$(file_size "$dst")"
-        if [ "$cur_size" = "$size" ]; then
+        local cs; cs="$(file_size "$dst")"
+        if [ "$cs" = "$size" ]; then
           if [ "${VERIFY_SHA}" = "true" ] && [ -n "$sha" ]; then
-            local cur_sha; cur_sha="$(sha256_of "$dst")"
-            if [ "$cur_sha" = "$sha" ]; then
-              ok=$((ok+1))
-            else
-              missing_list+=$'\n'"- ${rel} (SHA 不匹配)"
-            fi
-          else
-            ok=$((ok+1))
-          fi
-        else
-          missing_list+=$'\n'"- ${rel} (大小不匹配)"
-        fi
-      else
-        missing_list+=$'\n'"- ${rel} (缺失)"
-      fi
+            local csha; csha="$(sha256_of "$dst")"
+            [ "$csha" = "$sha" ] && ok=$((ok+1)) || missing+=$'\n'"- ${rel} (SHA 不匹配)"
+          else ok=$((ok+1)); fi
+        else missing+=$'\n'"- ${rel} (大小不匹配)"; fi
+      else missing+=$'\n'"- ${rel} (缺失)"; fi
     fi
   done
-
-  # 没有指针也视为“全部就绪”
-  if [ "$total" -eq 0 ]; then
-    echo "0/0"
-    return 0
-  fi
-
+  [ "$total" -eq 0 ] && echo "0/0" && return 0
   echo "${ok}/${total}"
-  if [ "$ok" -eq "$total" ]; then
-    return 0
-  else
-    if [ -n "$missing_list" ]; then
-      ERR "尚未就绪的文件:${missing_list}"
-    fi
-    return 1
-  fi
+  if [ "$ok" -eq "$total" ]; then return 0; else [ -n "$missing" ] && ERR "尚未就绪的文件:${missing}"; return 1; fi
 }
-
-# 阻塞等待：直到所有 .pointer 对应大文件下载完成（或超时）
 wait_until_hydrated() {
   LOG "开始等待所有数据下载完成..."
-  local start_ts now_ts elapsed
-  start_ts="$(date +%s)"
-
+  local start_ts; start_ts="$(date +%s)"
   while true; do
-    # 尝试下载一次（容错）
     hydrate_from_pointers
-
-    local progress
-    progress="$(all_pointers_hydrated || true)"
-    if all_pointers_hydrated >/dev/null 2>&1; then
-      LOG "数据就绪：${progress}"
-      break
-    else
-      LOG "进度：${progress}，继续等待..."
-    fi
-
+    local progress; progress="$(all_pointers_hydrated || true)"
+    if all_pointers_hydrated >/dev/null 2>&1; then LOG "数据就绪：${progress}"; break
+    else LOG "进度：${progress}，继续等待..."; fi
     if [ "${HYDRATE_TIMEOUT}" != "0" ]; then
-      now_ts="$(date +%s)"
-      elapsed=$((now_ts - start_ts))
-      if [ "$elapsed" -ge "${HYDRATE_TIMEOUT}" ]; then
-        ERR "等待超时（${HYDRATE_TIMEOUT}s），仍有数据未就绪。"
-        exit 1
-      fi
+      local elapsed=$(( $(date +%s) - start_ts ))
+      [ "$elapsed" -ge "${HYDRATE_TIMEOUT}" ] && ERR "等待超时（${HYDRATE_TIMEOUT}s），仍有数据未就绪。" && exit 1
     fi
     sleep "${HYDRATE_CHECK_INTERVAL}"
   done
 }
 
-# 提交并推送（FD 锁避免并发）
+# --------- 提交/推送 ---------
 commit_and_push() {
   local lock="/tmp/history-git.lock"
   exec {lockfd}>"$lock" || true
@@ -599,79 +467,62 @@ commit_and_push() {
   fi
 }
 
+# --------- 监控（容错不退出） ---------
+monitor_tick() {
+  for target in $TARGETS; do process_target "$target"; done
+  pointerize_large_files
+  hydrate_from_pointers
+  commit_and_push
+}
 start_monitor() {
-  LOG "启动监控（旧文件修改会提交；大文件使用 Release 指针，并保持本地同步）"
+  LOG "启动监控（出错自动继续；大文件更新会上传到 Release，并同步到本地）"
+  set +e
   while true; do
-    # 1) 处理新出现的目标
-    for target in $TARGETS; do
-      process_target "$target"
-    done
-
-    # 2) 指针化大文件
-    pointerize_large_files
-
-    # 3) 根据指针同步本地大文件
-    hydrate_from_pointers
-
-    # 4) 提交并推送
-    commit_and_push
-
+    if ! monitor_tick; then ERR "本轮监控出现错误，继续下一轮"; fi
     sleep 5
   done
+  set -e
 }
 
+# --------- 主流程 ---------
 do_init() {
   load_env
   ensure_repo
   link_targets
 
-  # 首次扫描与提交（如果本地已有大文件，会生成 .pointer 并仅提交指针）
+  # 首次扫描与提交（本地已有大文件会生成 .pointer，仅提交指针）
   pointerize_large_files
   commit_and_push
 
-  # 阻塞等待：下载所有 .pointer 指向的大文件并校验（只有新环境才需要下载）
+  # 阻塞等待：下载所有 .pointer 指向的大文件
   wait_until_hydrated
 
   chmod -R 777 "${BASE}/history" || true
 
-  # 所有数据就绪后，创建标志文件，供外部流程判定开始
-  touch "${BASE}/.initialized"
-  touch "${BASE}/.git_sync_done"
+  # 全部数据就绪
+  touch "${BASE}/.initialized" "${BASE}/.git_sync_done"
   LOG "Git同步已完成，全部数据已就绪"
 
-  # 可选：执行后续启动命令
+  # 可选：执行后续命令
   if [ -n "${AFTER_SYNC_CMD}" ]; then
     LOG "执行 AFTER_SYNC_CMD: ${AFTER_SYNC_CMD}"
     bash -lc "${AFTER_SYNC_CMD}" || ERR "AFTER_SYNC_CMD 运行失败"
   fi
 
-  # 启动监控循环（前台阻塞）
   start_monitor
 }
 
+# --------- 其它命令 ---------
 release() { rm -rf "${BASE}/history"; }
-
 update() {
-  if git -C "${BASE}/history" remote | grep -q '^origin$'; then
-    git -C "${BASE}/history" pull --rebase origin main || true
-  fi
+  if git -C "${BASE}/history" remote | grep -q '^origin$'; then git -C "${BASE}/history" pull --rebase origin main || true; fi
   link_targets
   pointerize_large_files
   wait_until_hydrated
   commit_and_push
 }
-
 mark_git_sync_done() { touch "${BASE}/.git_sync_done"; echo "Git同步已完成，创建标志文件"; }
-
-check_git_sync_done() {
-  if [ -f "${BASE}/.git_sync_done" ]; then
-    echo "Git同步已完成"
-    return 0
-  else
-    echo "Git同步尚未完成"
-    return 1
-  fi
-}
+check_git_sync_done() { if [ -f "${BASE}/.git_sync_done" ]; then echo "Git同步已完成"; return 0; else echo "Git同步尚未完成"; return 1; fi; }
 
 case "${1:-init}" in
   env) load_env ;;
