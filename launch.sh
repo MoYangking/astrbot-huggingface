@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-MODE="${1:-init}"  # 控制退出日志：只对 init/monitor 的非零退出告警
+MODE="${1:-init}"  # 仅对 init/monitor 的非零退出告警
 
 # 基础目录
 BASE="${BASE:-$PWD}"
@@ -31,7 +31,6 @@ mkdir -p "$HOME" >/dev/null 2>&1 || true
 LOG() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
 ERR() { printf '[%s] ERROR: %s\n' "$(date '+%F %T')" "$*" >&2; }
 
-# 仅对 init/monitor 非零退出打印错误
 trap 'code=$?; if { [ "$MODE" = "init" ] || [ "$MODE" = "monitor" ]; } && [ $code -ne 0 ]; then ERR "launch.sh 异常退出（$code）"; fi' EXIT
 
 # ---------- 工具 ----------
@@ -58,6 +57,8 @@ now_ts() { date +%s; }
 STATE="${BASE}/history/.pointer_scan_state.json"
 state_init() {
   if [ ! -f "$STATE" ]; then echo '{"paths":{}}' > "$STATE"; fi
+  # 如果损坏则重置
+  if ! jq -e . "$STATE" >/dev/null 2>&1; then echo '{"paths":{}}' > "$STATE"; fi
   if ! jq -e 'has("paths")' "$STATE" >/dev/null 2>&1; then
     local tmp; tmp="$(mktemp)"; jq '{paths:.}' "$STATE" > "$tmp" && mv -f "$tmp" "$STATE"
   fi
@@ -66,21 +67,29 @@ state_get() { # arg: rel field -> value
   local rel="$1" field="$2"
   jq -r --arg k "$rel" --arg f "$field" '.paths[$k][$f] // empty' "$STATE" 2>/dev/null || true
 }
-state_set() { # rel mtime size sha last_check
+state_set() { # rel mtime size sha last_check （全部用字符串传入，内部转数字）
   local rel="$1" m="$2" sz="$3" sha="$4" lc="$5"
   local tmp; tmp="$(mktemp)"
-  jq -c --arg k "$rel" --argjson m "$m" --argjson sz "$sz" --arg sha "$sha" --argjson lc "$lc" '
-    .paths[$k] = {mtime:$m,size:$sz,sha:$sha,last_check:$lc}' "$STATE" > "$tmp" && mv -f "$tmp" "$STATE"
+  jq -c --arg k "$rel" --arg m "$m" --arg sz "$sz" --arg sha "$sha" --arg lc "$lc" '
+    .paths[$k] = {
+      mtime: (($m|tonumber?) // 0),
+      size: (($sz|tonumber?) // 0),
+      sha: $sha,
+      last_check: (($lc|tonumber?) // 0)
+    }' "$STATE" > "$tmp" && mv -f "$tmp" "$STATE"
 }
 
 # ---------- ENV ----------
 load_env() {
   if [ -n "${fetch:-}" ]; then
     LOG '远程获取参数...'
-    curl -fsSL "$fetch" -o "${BASE}/data.json"
-    export github_secret github_project
-    github_secret="$(jq -r '.github_secret // empty' "${BASE}/data.json")"
-    github_project="$(jq -r '.github_project // empty' "${BASE}/data.json")"
+    if curl -fsSL "$fetch" -o "${BASE}/data.json"; then
+      export github_secret github_project
+      github_secret="$(jq -r '.github_secret // empty' "${BASE}/data.json" 2>/dev/null || echo "")"
+      github_project="$(jq -r '.github_project // empty' "${BASE}/data.json" 2>/dev/null || echo "")"
+    else
+      ERR "fetch 地址不可用：$fetch"
+    fi
   fi
   if [ -f "${BASE}/launch.sh" ]; then
     local sec_esc proj_esc
@@ -92,6 +101,17 @@ load_env() {
 }
 
 # ---------- Git ----------
+git_sanitize_repo() {
+  local dir="${BASE}/history"
+  # 终止未完成操作
+  git -C "$dir" rebase --abort >/dev/null 2>&1 || true
+  git -C "$dir" merge --abort >/dev/null 2>&1 || true
+  git -C "$dir" cherry-pick --abort >/dev/null 2>&1 || true
+  rm -rf "$dir/.git/rebase-merge" "$dir/.git/REBASE_HEAD" "$dir/.git/REBASE_APPLY" >/dev/null 2>&1 || true
+  # 确保在 main 分支而不是 detached HEAD
+  local cur; cur="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
+  if [ "$cur" != "main" ]; then git -C "$dir" checkout -B main >/dev/null 2>&1 || true; fi
+}
 ensure_repo() {
   mkdir -p "${BASE}/history"
   git config --global --add safe.directory "${BASE}/history" >/dev/null 2>&1 || true
@@ -106,8 +126,8 @@ ensure_repo() {
   else
     LOG "Git仓库已存在"
     local current_branch
-    current_branch="$(git -C "${BASE}/history" branch --show-current || true)"
-    if [ "${current_branch}" != "main" ]; then git -C "${BASE}/history" checkout -B main; fi
+    current_branch="$(git -C "${BASE}/history" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    if [ "${current_branch}" != "main" ]; then git -C "${BASE}/history" checkout -B main || true; fi
   fi
 
   if [ -n "${github_project:-}" ] && [ "${github_project#*/}" = "${github_project}" ]; then
@@ -128,11 +148,9 @@ ensure_repo() {
 
   if git -C "${BASE}/history" remote | grep -q '^origin$'; then
     LOG "尝试从远程仓库拉取数据..."
-    if git -C "${BASE}/history" fetch origin main; then
-      git -C "${BASE}/history" merge --ff-only origin/main || git -C "${BASE}/history" pull --rebase origin main || true
-    else
-      LOG "远端 fetch 失败（可能是新仓库），将于首次提交时推送"
-    fi
+    git -C "${BASE}/history" fetch origin main || true
+    git_sanitize_repo
+    git -C "${BASE}/history" pull --rebase --autostash origin main || true
   fi
 }
 
@@ -178,9 +196,9 @@ gh_ensure_release() {
   code="$(curl -sS -o "$tmp" -w '%{http_code}' -H "Authorization: Bearer ${github_secret}" -H "Accept: application/vnd.github+json" "${api}/repos/${github_project}/releases/tags/${RELEASE_TAG}")"
   if [ "$code" = "200" ]; then jq -r '.id // empty' "$tmp"; rm -f "$tmp"; return 0; fi
   rm -f "$tmp"
-  local payload; payload="$(jq -nc --arg tag "$RELEASE_TAG" --arg name "$RELEASE_TAG" '{tag_name:$tag,name:$name,target_commitish:"main",draft:false,prerelease:false}')"
+  local payload; payload="$(jq -nc --arg tag "$RELEASE_TAG" --arg name "$RELEASE_TAG" '{tag_name:$tag,name:$name,target_commitish:"main",draft:false,prerelease:false}')" || return 1
   local res rid; res="$(curl -sS -X POST -H "Authorization: Bearer ${github_secret}" -H "Accept: application/vnd.github+json" -H "Content-Type: application/json" -d "$payload" "${api}/repos/${github_project}/releases")"
-  rid="$(echo "$res" | jq -r '.id // empty')"
+  rid="$(echo "$res" | jq -r '.id // empty' 2>/dev/null || echo "")"
   [ -n "$rid" ] && [ "$rid" != "null" ] && echo "$rid" && return 0
   echo "创建 release 失败：$res" >&2; return 1
 }
@@ -194,10 +212,9 @@ gh_delete_asset() {
   local code; code="$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE -H "Authorization: Bearer ${github_secret}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${github_project}/releases/assets/${asset_id}")"
   [ "$code" = "204" ] && LOG "已删除旧 asset: ${asset_id}" || LOG "删除旧 asset 失败(code=$code)，忽略"
 }
-# 在指定 tag 中寻找 basename 对应的“最新” asset（名称形如 64sha-basename）
 find_latest_asset() {
   local repo="$1" tag="$2" basename="$3"
-  local res; res="$(curl -sS ${github_secret:+-H "Authorization: Bearer ${github_secret}"} -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${repo}/releases/tags/${tag}")" || return 1
+  local res; res="$(curl -sS ${github_secret:+-H "Authorization: Bearer ${github_secret}"} -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${repo}/releases/tags/${tag}" 2>/dev/null)" || return 1
   echo "$res" | jq -r --arg bn "$basename" '
     (.assets // []) 
     | map(select(.name | test("^[0-9a-fA-F]{64}-" + $bn + "$")))
@@ -248,9 +265,7 @@ process_large_file() {
   local changed_on_disk="false"
   { [ "$mtime" != "$last_mtime" ] || [ "$size" != "$last_size" ]; } && changed_on_disk="true"
 
-  # 修复这里的算术错误：先展开默认值，再做运算
   local lc; lc="${last_check:-0}"
-  # 需要检查？首次/磁盘变更/间隔已到
   local should_check="false"
   if [ ! -f "$pointer" ] || [ "$changed_on_disk" = "true" ] || (( now - lc >= SCAN_INTERVAL_SECS )); then
     should_check="true"
@@ -275,15 +290,15 @@ process_large_file() {
     if [ -n "$rid" ]; then
       LOG "上传大文件到 release: ${rel} (${size} bytes, sha=${sha:0:8}...)"
       resp="$(gh_upload_asset "$rid" "$f" "$asset_name" || true)"
-      dl="$(echo "$resp" | jq -r '.browser_download_url // empty')"
-      new_asset_id="$(echo "$resp" | jq -r '.id // empty')"
+      dl="$(echo "$resp" | jq -r '.browser_download_url // empty' 2>/dev/null || echo "")"
+      new_asset_id="$(echo "$resp" | jq -r '.id // empty' 2>/dev/null || echo "")"
 
       # 兜底：同名已存在时查询
       if { [ -z "$dl" ] || [ "$dl" = "null" ] || [ -z "$new_asset_id" ] || [ "$new_asset_id" = "null" ]; } && [ -n "${github_project:-}" ]; then
         local res2
         res2="$(curl -sS -H "Authorization: Bearer ${github_secret}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${github_project}/releases/${rid}/assets?per_page=100")"
-        new_asset_id="$(echo "$res2" | jq -r --arg n "$asset_name" '.[]?|select(.name==$n).id // empty')"
-        dl="$(echo "$res2" | jq -r --arg n "$asset_name" '.[]?|select(.name==$n).browser_download_url // empty')"
+        new_asset_id="$(echo "$res2" | jq -r --arg n "$asset_name" '.[]?|select(.name==$n).id // empty' 2>/dev/null || echo "")"
+        dl="$(echo "$res2" | jq -r --arg n "$asset_name" '.[]?|select(.name==$n).browser_download_url // empty' 2>/dev/null || echo "")"
       fi
 
       if [ -n "$new_asset_id" ] && [ "$new_asset_id" != "null" ]; then upload_ok="true"; fi
@@ -293,26 +308,30 @@ process_large_file() {
 
     # 只有上传成功才更新指针与清理旧 asset
     if [ "$upload_ok" = "true" ] && [ -n "$new_asset_id" ] && [ "$new_asset_id" != "null" ]; then
-      # 删除旧 asset（可选）
       if [ -f "$pointer" ] && [ "${KEEP_OLD_ASSETS}" != "true" ] && [ -n "${github_secret:-}" ] && [ -n "${github_project:-}" ]; then
-        local old_asset_id; old_asset_id="$(jq -r '.asset_id // empty' "$pointer" 2>/dev/null || true)"
+        local old_asset_id; old_asset_id="$(jq -r '.asset_id // empty' "$pointer" 2>/dev/null || echo "")"
         [ -n "$old_asset_id" ] && [ "$old_asset_id" != "null" ] && gh_delete_asset "$old_asset_id" || true
       fi
 
-      # 原子更新指针
       local tmp_ptr; tmp_ptr="$(mktemp)"
-      jq -nc --arg repo "${github_project:-}" --arg tag "$RELEASE_TAG" --arg asset "$asset_name" \
-        --arg url "${dl:-}" --arg path "$rel" --arg sha "$sha" --argjson size "$size" \
-        --argjson asset_id "${new_asset_id:-0}" '
+      jq -nc \
+        --arg repo "${github_project:-}" \
+        --arg tag "$RELEASE_TAG" \
+        --arg asset "$asset_name" \
+        --arg url "${dl:-}" \
+        --arg path "$rel" \
+        --arg sha "$sha" \
+        --arg size "$size" \
+        --arg asset_id "${new_asset_id:-}" '
         {
           type: "release-asset",
           repo: $repo,
           release_tag: $tag,
           asset_name: $asset,
-          asset_id: (if $asset_id == 0 then null else $asset_id end),
-          download_url: (if $url == "" then null else $url end),
+          asset_id: ( ($asset_id|tonumber?) // null ),
+          download_url: (if $url == "" or $url == "null" then null else $url end),
           sha256: $sha,
-          size: $size,
+          size: (($size|tonumber?) // 0),
           original_path: $path,
           generated_at: (now | todate)
         }' > "$tmp_ptr"
@@ -325,7 +344,6 @@ process_large_file() {
       state_set "$rel" "$mtime" "$size" "${old_sha:-""}" "$now"
     fi
   else
-    # 无需上传，仅刷新检查时间
     state_set "$rel" "$mtime" "$size" "$sha" "$now"
   fi
 }
@@ -362,14 +380,14 @@ hydrate_one_pointer() {
   local ptr="$1"; [ -f "$ptr" ] || return 0
 
   local repo tag asset_name asset_id url sha size rel_path
-  repo="$(jq -r '.repo // empty' "$ptr")"
-  tag="$(jq -r '.release_tag // empty' "$ptr")"
-  asset_name="$(jq -r '.asset_name // empty' "$ptr")"
-  asset_id="$(jq -r '.asset_id // empty' "$ptr")"
-  url="$(jq -r '.download_url // empty' "$ptr")"
-  sha="$(jq -r '.sha256 // empty' "$ptr")"
-  size="$(jq -r '.size // 0' "$ptr")"
-  rel_path="$(jq -r '.original_path // empty' "$ptr")"
+  repo="$(jq -r '.repo // empty' "$ptr" 2>/dev/null || echo "")"
+  tag="$(jq -r '.release_tag // empty' "$ptr" 2>/dev/null || echo "")"
+  asset_name="$(jq -r '.asset_name // empty' "$ptr" 2>/dev/null || echo "")"
+  asset_id="$(jq -r '.asset_id // empty' "$ptr" 2>/dev/null || echo "")"
+  url="$(jq -r '.download_url // empty' "$ptr" 2>/dev/null || echo "")"
+  sha="$(jq -r '.sha256 // empty' "$ptr" 2>/dev/null || echo "")"
+  size="$(jq -r '.size // 0' "$ptr" 2>/dev/null || echo 0)"
+  rel_path="$(jq -r '.original_path // empty' "$ptr" 2>/dev/null || echo "")"
   [ -n "$rel_path" ] || { ERR "pointer 缺少 original_path: $ptr"; return 1; }
 
   local dst="${BASE}/history/${rel_path}"
@@ -392,11 +410,10 @@ hydrate_one_pointer() {
   elif [ -n "$url" ] && [ "$url" != "null" ]; then
     dl_url="$url"; [ -n "${github_secret:-}" ] && headers=(-H "Authorization: Bearer ${github_secret}")
   elif [ -n "$repo" ] && [ -n "$tag" ] && [ -n "$asset_name" ]; then
-    # 无直接 URL 时尝试从 tag 查找当前 asset_name
     local res aid burl
-    res="$(curl -sS ${github_secret:+-H "Authorization: Bearer ${github_secret}"} -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${repo}/releases/tags/${tag}")" || true
-    aid="$(echo "$res" | jq -r --arg n "$asset_name" '.assets[]?|select(.name==$n).id // empty')"
-    burl="$(echo "$res" | jq -r --arg n "$asset_name" '.assets[]?|select(.name==$n).browser_download_url // empty')"
+    res="$(curl -sS ${github_secret:+-H "Authorization: Bearer ${github_secret}"} -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${repo}/releases/tags/${tag}" 2>/dev/null)" || true
+    aid="$(echo "$res" | jq -r --arg n "$asset_name" '.assets[]?|select(.name==$n).id // empty' 2>/dev/null || echo "")"
+    burl="$(echo "$res" | jq -r --arg n "$asset_name" '.assets[]?|select(.name==$n).browser_download_url // empty' 2>/dev/null || echo "")"
     if [ -n "$aid" ]; then
       dl_url="https://api.github.com/repos/${repo}/releases/assets/${aid}"
       headers=(-H "Authorization: Bearer ${github_secret}" -H "Accept: application/octet-stream")
@@ -430,12 +447,12 @@ hydrate_one_pointer() {
         size2="$(echo "$tsv" | awk -F'\t' '{print $4}')"
         sha2="$(printf '%s' "$name2" | sed -E 's/^([0-9a-fA-F]{64})-.+/\1/')" || true
 
-        local url_for_dl headers2
+        local url_for_dl headers2=()
         if [ -n "$aid2" ] && [ -n "${github_secret:-}" ]; then
           url_for_dl="https://api.github.com/repos/${repo_fallback}/releases/assets/${aid2}"
           headers2=(-H "Authorization: Bearer ${github_secret}" -H "Accept: application/octet-stream")
         else
-          url_for_dl="$url2"; headers2=()
+          url_for_dl="$url2"
           [ -n "${github_secret:-}" ] && headers2=(-H "Authorization: Bearer ${github_secret}")
         fi
 
@@ -444,7 +461,6 @@ hydrate_one_pointer() {
             ERR "回退下载失败：$rel_path"; rm -f "$tmp" 2>/dev/null || true; return 1
           fi
 
-          # 用回退 asset 的信息校验并原子更新指针
           local got_size; got_size="$(file_size "$tmp" || echo 0)"
           if [ -n "$size2" ] && [ "$size2" != "null" ] && [ "$got_size" != "$size2" ]; then
             ERR "回退下载大小不匹配，期望 $size2 实际 $got_size: $rel_path"; rm -f "$tmp"; return 1
@@ -456,20 +472,26 @@ hydrate_one_pointer() {
 
           mv -f "$tmp" "$dst"; chmod 0644 "$dst" || true
 
-          # 更新指针为“最新 asset”
+          # 更新指针为“最新 asset”（全部用字符串参数 + tonumber?）
           local tmp_ptr; tmp_ptr="$(mktemp)"
-          jq -nc --arg repo "$repo_fallback" --arg tag "$tag_fallback" --arg asset "$name2" \
-            --arg url "$url2" --arg path "$rel_path" --arg sha "$sha2" --argjson size "${size2:-0}" \
-            --argjson asset_id "${aid2:-0}" '
+          jq -nc \
+            --arg repo "$repo_fallback" \
+            --arg tag "$tag_fallback" \
+            --arg asset "$name2" \
+            --arg url "$url2" \
+            --arg path "$rel_path" \
+            --arg sha "$sha2" \
+            --arg size "$size2" \
+            --arg asset_id "$aid2" '
             {
               type: "release-asset",
               repo: $repo,
               release_tag: $tag,
               asset_name: $asset,
-              asset_id: (if $asset_id == 0 then null else $asset_id end),
+              asset_id: ( ($asset_id|tonumber?) // null ),
               download_url: (if $url == "" or $url == "null" then null else $url end),
               sha256: $sha,
-              size: $size,
+              size: (($size|tonumber?) // 0),
               original_path: $path,
               generated_at: (now | todate)
             }' > "$tmp_ptr"
@@ -518,10 +540,10 @@ all_pointers_hydrated() {
       while IFS= read -r -d '' p; do
         total=$((total+1))
         local rel dst size sha
-        rel="$(jq -r '.original_path // empty' "$p")"
+        rel="$(jq -r '.original_path // empty' "$p" 2>/dev/null || echo "")"
         dst="${BASE}/history/${rel}"
-        size="$(jq -r '.size // 0' "$p")"
-        sha="$(jq -r '.sha256 // empty' "$p")"
+        size="$(jq -r '.size // 0' "$p" 2>/dev/null || echo 0)"
+        sha="$(jq -r '.sha256 // empty' "$p" 2>/dev/null || echo "")"
         if [ -f "$dst" ]; then
           local cs; cs="$(file_size "$dst" || echo 0)"
           if [ "$cs" = "$size" ]; then
@@ -535,8 +557,8 @@ all_pointers_hydrated() {
     elif [ -f "${root}.pointer" ]; then
       total=$((total+1))
       local p="${root}.pointer" rel dst size sha
-      rel="$(jq -r '.original_path // empty' "$p")"; dst="${BASE}/history/${rel}"
-      size="$(jq -r '.size // 0' "$p")"; sha="$(jq -r '.sha256 // empty' "$p")"
+      rel="$(jq -r '.original_path // empty' "$p" 2>/dev/null || echo "")"; dst="${BASE}/history/${rel}"
+      size="$(jq -r '.size // 0' "$p" 2>/dev/null || echo 0)"; sha="$(jq -r '.sha256 // empty' "$p" 2>/dev/null || echo "")"
       if [ -f "$dst" ]; then
         local cs; cs="$(file_size "$dst" || echo 0)"
         if [ "$cs" = "$size" ]; then
@@ -569,27 +591,50 @@ wait_until_hydrated() {
   done
 }
 
-# ---------- 提交/推送 ----------
+# ---------- 提交/推送（自愈 rebase、push 重试） ----------
 commit_and_push() {
+  local dir="${BASE}/history"
   local lock="/tmp/history-git.lock"
   exec {lockfd}>"$lock" || true
-  if flock -n "$lockfd"; then
-    if git -C "${BASE}/history" status --porcelain | grep -q .; then
-      git -C "${BASE}/history" add -A
-      git -C "${BASE}/history" commit -m "auto: $(date '+%Y-%m-%d %H:%M:%S')" || true
-      if git -C "${BASE}/history" remote | grep -q '^origin$'; then
-        git -C "${BASE}/history" pull --rebase origin main || true
-        git -C "${BASE}/history" push -u origin main || true
-      fi
-    fi
-    flock -u "$lockfd" || true
-    exec {lockfd}>&- || true
-  else
-    LOG "另一个提交进程正在运行，跳过本次"
+  if ! flock -n "$lockfd"; then
+    LOG "另一个提交进程正在运行，跳过本次"; return 0
   fi
+
+  git_sanitize_repo
+
+  # 有变更就提交
+  if git -C "$dir" status --porcelain | grep -q .; then
+    git -C "$dir" add -A
+    git -C "$dir" commit -m "auto: $(date '+%Y-%m-%d %H:%M:%S')" || true
+  fi
+
+  if git -C "$dir" remote | grep -q '^origin$'; then
+    local attempt
+    for attempt in 1 2 3; do
+      git -C "$dir" fetch origin main || true
+      # 先同步远端到本地（自动暂存）再推
+      if ! git -C "$dir" pull --rebase --autostash origin main; then
+        git -C "$dir" rebase --abort >/dev/null 2>&1 || true
+        LOG "pull --rebase 失败（第${attempt}次），继续重试"
+      fi
+      if git -C "$dir" push -u origin main; then
+        LOG "推送成功（第${attempt}次）"
+        break
+      else
+        LOG "推送被拒绝，准备重试（第${attempt}次）"
+        sleep 1
+      fi
+    done
+    if [ "$attempt" = "3" ]; then
+      ERR "多次重试仍无法推送，已保留本地提交，等待下轮重试"
+    end
+  fi
+
+  flock -u "$lockfd" || true
+  exec {lockfd}>&- || true
 }
 
-# ---------- 监控（容错不退出；2小时节流） ----------
+# ---------- 监控 ----------
 monitor_tick() {
   for target in $TARGETS; do process_target "$target"; done
   pointerize_large_files
@@ -597,7 +642,7 @@ monitor_tick() {
   commit_and_push
 }
 start_monitor() {
-  LOG "启动监控（失败自动继续；大文件上传成功才更新指针；下载404回退最新 asset）"
+  LOG "启动监控（失败自动继续；上传成功才更新指针；下载404回退最新 asset）"
   set +e
   while true; do
     if ! monitor_tick; then ERR "本轮监控出现错误，继续下一轮"; fi
@@ -631,7 +676,7 @@ do_init() {
 # ---------- 其它命令 ----------
 release() { rm -rf "${BASE}/history"; }
 update() {
-  if git -C "${BASE}/history" remote | grep -q '^origin$'; then git -C "${BASE}/history" pull --rebase origin main || true; fi
+  if git -C "${BASE}/history" remote | grep -q '^origin$'; then git -C "${BASE}/history" pull --rebase --autostash origin main || true; fi
   link_targets
   pointerize_large_files
   wait_until_hydrated
