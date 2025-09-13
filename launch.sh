@@ -3,6 +3,10 @@ set -Eeuo pipefail
 
 MODE="${1:-init}"  # 仅对 init/monitor 的非零退出告警
 
+# 日志函数 - 必须在最前面定义
+LOG() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
+ERR() { printf '[%s] ERROR: %s\n' "$(date '+%F %T')" "$*" >&2; }
+
 # 基础目录
 BASE="${BASE:-$PWD}"
 BASE="$(cd "$BASE" && pwd)"
@@ -39,9 +43,6 @@ mkdir -p "$HOME" >/dev/null 2>&1 || true
 # 临时目录设置
 export TMPDIR="${DATA_DIR}/tmp"
 mkdir -p "$TMPDIR" >/dev/null 2>&1 || true
-
-LOG() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
-ERR() { printf '[%s] ERROR: %s\n' "$(date '+%F %T')" "$*" >&2; }
 
 trap 'code=$?; if { [ "$MODE" = "init" ] || [ "$MODE" = "monitor" ]; } && [ $code -ne 0 ]; then ERR "launch.sh 异常退出（$code）"; fi' EXIT
 
