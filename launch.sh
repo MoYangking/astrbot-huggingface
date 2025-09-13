@@ -7,9 +7,6 @@ MODE="${1:-init}"  # 仅对 init/monitor 的非零退出告警
 BASE="${BASE:-$PWD}"
 BASE="$(cd "$BASE" && pwd)"
 
-# 在Hugging Face Spaces中使用/data目录（有读写权限）
-HISTORY_DIR="${HISTORY_DIR:-/data/history}"
-
 # 管理的目标（相对 BASE，目录会递归处理）
 TARGETS="${TARGETS:-appsettings.json data device.json keystore.json lagrange-0-db qr-0.png}"
 
@@ -57,7 +54,7 @@ file_mtime() {
 }
 now_ts() { date +%s; }
 
-STATE="${HISTORY_DIR}/.pointer_scan_state.json"
+STATE="${BASE}/history/.pointer_scan_state.json"
 state_init() {
   if [ ! -f "$STATE" ]; then echo '{"paths":{}}' > "$STATE"; fi
   # 如果损坏则重置
@@ -105,7 +102,7 @@ load_env() {
 
 # ---------- Git ----------
 git_sanitize_repo() {
-  local dir="${HISTORY_DIR}"
+  local dir="${BASE}/history"
   git -C "$dir" rebase --abort >/dev/null 2>&1 || true
   git -C "$dir" merge --abort >/dev/null 2>&1 || true
   git -C "$dir" cherry-pick --abort >/dev/null 2>&1 || true
@@ -114,21 +111,21 @@ git_sanitize_repo() {
   if [ "$cur" != "main" ]; then git -C "$dir" checkout -B main >/dev/null 2>&1 || true; fi
 }
 ensure_repo() {
-  mkdir -p "${HISTORY_DIR}"
-  git config --global --add safe.directory "${HISTORY_DIR}" >/dev/null 2>&1 || true
+  mkdir -p "${BASE}/history"
+  git config --global --add safe.directory "${BASE}/history" >/dev/null 2>&1 || true
 
-  if [ ! -d "${HISTORY_DIR}/.git" ]; then
+  if [ ! -d "${BASE}/history/.git" ]; then
     LOG "初始化新的Git仓库"
-    git -C "${HISTORY_DIR}" init -b main
-    git -C "${HISTORY_DIR}" config user.email "huggingface@hf.com"
-    git -C "${HISTORY_DIR}" config user.name "complete-Mmx"
-    git -C "${HISTORY_DIR}" config pull.rebase true
-    git -C "${HISTORY_DIR}" config rebase.autostash true
+    git -C "${BASE}/history" init -b main
+    git -C "${BASE}/history" config user.email "huggingface@hf.com"
+    git -C "${BASE}/history" config user.name "complete-Mmx"
+    git -C "${BASE}/history" config pull.rebase true
+    git -C "${BASE}/history" config rebase.autostash true
   else
     LOG "Git仓库已存在"
     local current_branch
-    current_branch="$(git -C "${HISTORY_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
-    if [ "${current_branch}" != "main" ]; then git -C "${HISTORY_DIR}" checkout -B main || true; fi
+    current_branch="$(git -C "${BASE}/history" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    if [ "${current_branch}" != "main" ]; then git -C "${BASE}/history" checkout -B main || true; fi
   fi
 
   if [ -n "${github_project:-}" ] && [ "${github_project#*/}" = "${github_project}" ]; then
@@ -138,20 +135,20 @@ ensure_repo() {
 
   if [ -n "${github_project:-}" ] && [ -n "${github_secret:-}" ]; then
     local url="https://x-access-token:${github_secret}@github.com/${github_project}.git"
-    if git -C "${HISTORY_DIR}" remote | grep -q '^origin$'; then
-      git -C "${HISTORY_DIR}" remote set-url origin "${url}"
+    if git -C "${BASE}/history" remote | grep -q '^origin$'; then
+      git -C "${BASE}/history" remote set-url origin "${url}"
     else
-      git -C "${HISTORY_DIR}" remote add origin "${url}"
+      git -C "${BASE}/history" remote add origin "${url}"
     fi
   else
     LOG "未提供 github_project 或 github_secret，跳过远端（本地可用）"
   fi
 
-  if git -C "${HISTORY_DIR}" remote | grep -q '^origin$'; then
+  if git -C "${BASE}/history" remote | grep -q '^origin$'; then
     LOG "尝试从远程仓库拉取数据..."
-    git -C "${HISTORY_DIR}" fetch origin main || true
+    git -C "${BASE}/history" fetch origin main || true
     git_sanitize_repo
-    git -C "${HISTORY_DIR}" pull --rebase --autostash origin main || true
+    git -C "${BASE}/history" pull --rebase --autostash origin main || true
   fi
 }
 
@@ -159,7 +156,7 @@ ensure_repo() {
 link_targets() {
   for target in $TARGETS; do
     local src="${BASE}/${target}"
-    local dst="${HISTORY_DIR}/${target}"
+    local dst="${BASE}/history/${target}"
     mkdir -p "$(dirname "${dst}")"
     if [ -e "${src}" ] && [ ! -L "${src}" ]; then
       LOG "初始化目标: ${target}"; mv -f "${src}" "${dst}"
@@ -176,13 +173,13 @@ process_target() {
   local target="$1"
   if [ -e "${BASE}/${target}" ] && [ ! -L "${BASE}/${target}" ]; then
     LOG "发现新增文件/目录: ${target}"
-    mkdir -p "$(dirname "${HISTORY_DIR}/${target}")"
-    mv -f "${BASE}/${target}" "${HISTORY_DIR}/${target}"
-    ln -s "${HISTORY_DIR}/${target}" "${BASE}/${target}"
+    mkdir -p "$(dirname "${BASE}/history/${target}")"
+    mv -f "${BASE}/${target}" "${BASE}/history/${target}"
+    ln -s "${BASE}/history/${target}" "${BASE}/${target}"
   fi
 }
 ensure_gitignore_entry() {
-  local rel="$1"; local gi="${HISTORY_DIR}/.gitignore"
+  local rel="$1"; local gi="${BASE}/history/.gitignore"
   touch "$gi"; grep -Fxq -- "$rel" "$gi" || echo "$rel" >> "$gi"
 }
 
@@ -229,7 +226,7 @@ process_large_file() {
   local release_id_hint="$1" f="$2"
   [ -f "$f" ] || return 0
 
-  local rel="${f#${HISTORY_DIR}/}"
+  local rel="${f#${BASE}/history/}"
   local pointer="${f}.pointer"
   local size; size="$(file_size "$f" || echo 0)"
   local mtime; mtime="$(file_mtime "$f" || echo 0)"
@@ -244,9 +241,9 @@ process_large_file() {
     # 真实文件模式：撤销指针
     if [ -f "$pointer" ]; then
       LOG "撤销指针化：${rel}（当前大小 ${size}）"
-      git -C "${HISTORY_DIR}" rm -f --cached "${rel}" >/dev/null 2>&1 || true
-      git -C "${HISTORY_DIR}" add -f "${rel}" || true
-      git -C "${HISTORY_DIR}" rm -f --cached "${rel}.pointer" >/dev/null 2>&1 || true
+      git -C "${BASE}/history" rm -f --cached "${rel}" >/dev/null 2>&1 || true
+      git -C "${BASE}/history" add -f "${rel}" || true
+      git -C "${BASE}/history" rm -f --cached "${rel}.pointer" >/dev/null 2>&1 || true
       rm -f "${pointer}" || true
     fi
     return 0
@@ -254,7 +251,7 @@ process_large_file() {
 
   # 指针模式：先确保不会把大文件提交进 Git
   ensure_gitignore_entry "$rel"
-  git -C "${HISTORY_DIR}" rm --cached -f "$rel" >/dev/null 2>&1 || true
+  git -C "${BASE}/history" rm --cached -f "$rel" >/dev/null 2>&1 || true
 
   state_init
   local last_check last_mtime last_size
@@ -337,7 +334,7 @@ process_large_file() {
           generated_at: (now | todate)
         }' > "$tmp_ptr"
       mv -f "$tmp_ptr" "$pointer"
-      git -C "${HISTORY_DIR}" add -f "$pointer" || true
+      git -C "${BASE}/history" add -f "$pointer" || true
 
       state_set "$rel" "$mtime" "$size" "$sha" "$now"
     else
@@ -352,7 +349,7 @@ process_large_file() {
 pointerize_large_files() {
   local release_id=""; if [ -n "${github_project:-}" ] && [ -n "${github_secret:-}" ]; then release_id="$(gh_ensure_release || echo "")"; fi
   for target in $TARGETS; do
-    local root="${HISTORY_DIR}/${target}"
+    local root="${BASE}/history/${target}"
     if [ -d "$root" ]; then
       find "$root" -type f ! -name '*.pointer' ! -path '*/.git/*' -print0 2>/dev/null \
         | while IFS= read -r -d '' f; do process_large_file "$release_id" "$f" || true; done
@@ -391,7 +388,7 @@ hydrate_one_pointer() {
   rel_path="$(jq -r '.original_path // empty' "$ptr" 2>/dev/null || echo "")"
   [ -n "$rel_path" ] || { ERR "pointer 缺少 original_path: $ptr"; return 1; }
 
-  local dst="${HISTORY_DIR}/${rel_path}"
+  local dst="${BASE}/history/${rel_path}"
   mkdir -p "$(dirname "$dst")"
   ensure_gitignore_entry "$rel_path"
 
@@ -497,7 +494,7 @@ hydrate_one_pointer() {
               generated_at: (now | todate)
             }' > "$tmp_ptr"
           mv -f "$tmp_ptr" "$ptr"
-          git -C "${HISTORY_DIR}" add -f "$ptr" || true
+          git -C "${BASE}/history" add -f "$ptr" || true
           return 0
         fi
       fi
@@ -522,7 +519,7 @@ hydrate_one_pointer() {
 
 hydrate_from_pointers() {
   for target in $TARGETS; do
-    local root="${HISTORY_DIR}/${target}"
+    local root="${BASE}/history/${target}"
     if [ -d "$root" ]; then
       find "$root" -type f -name '*.pointer' -print0 2>/dev/null \
         | while IFS= read -r -d '' p; do hydrate_one_pointer "$p" || true; done
@@ -536,13 +533,13 @@ hydrate_from_pointers() {
 all_pointers_hydrated() {
   local total=0 ok=0 missing=""
   for target in $TARGETS; do
-    local root="${HISTORY_DIR}/${target}"
+    local root="${BASE}/history/${target}"
     if [ -d "$root" ]; then
       while IFS= read -r -d '' p; do
         total=$((total+1))
         local rel dst size sha
         rel="$(jq -r '.original_path // empty' "$p" 2>/dev/null || echo "")"
-        dst="${HISTORY_DIR}/${rel}"
+        dst="${BASE}/history/${rel}"
         size="$(jq -r '.size // 0' "$p" 2>/dev/null || echo 0)"
         sha="$(jq -r '.sha256 // empty' "$p" 2>/dev/null || echo "")"
         if [ -f "$dst" ]; then
@@ -558,7 +555,7 @@ all_pointers_hydrated() {
     elif [ -f "${root}.pointer" ]; then
       total=$((total+1))
       local p="${root}.pointer" rel dst size sha
-      rel="$(jq -r '.original_path // empty' "$p" 2>/dev/null || echo "")"; dst="${HISTORY_DIR}/${rel}"
+      rel="$(jq -r '.original_path // empty' "$p" 2>/dev/null || echo "")"; dst="${BASE}/history/${rel}"
       size="$(jq -r '.size // 0' "$p" 2>/dev/null || echo 0)"; sha="$(jq -r '.sha256 // empty' "$p" 2>/dev/null || echo "")"
       if [ -f "$dst" ]; then
         local cs; cs="$(file_size "$dst" || echo 0)"
@@ -594,7 +591,7 @@ wait_until_hydrated() {
 
 # ---------- 提交/推送（自愈 rebase、push 重试） ----------
 commit_and_push() {
-  local dir="${HISTORY_DIR}"
+  local dir="${BASE}/history"
   local lock="/tmp/history-git.lock"
   exec {lockfd}>"$lock" || true
   if ! flock -n "$lockfd"; then
@@ -663,7 +660,7 @@ do_init() {
 
   wait_until_hydrated
 
-  chmod -R 777 "${HISTORY_DIR}" || true
+  chmod -R 777 "${BASE}/history" || true
   touch "${BASE}/.initialized" "${BASE}/.git_sync_done"
   LOG "Git同步已完成，全部数据已就绪"
 
@@ -675,9 +672,9 @@ do_init() {
 }
 
 # ---------- 其它命令 ----------
-release() { rm -rf "${HISTORY_DIR}"; }
+release() { rm -rf "${BASE}/history"; }
 update() {
-  if git -C "${HISTORY_DIR}" remote | grep -q '^origin$'; then git -C "${HISTORY_DIR}" pull --rebase --autostash origin main || true; fi
+  if git -C "${BASE}/history" remote | grep -q '^origin$'; then git -C "${BASE}/history" pull --rebase --autostash origin main || true; fi
   link_targets
   pointerize_large_files
   wait_until_hydrated
