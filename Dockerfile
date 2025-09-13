@@ -19,6 +19,8 @@ ARG PIP_PACKAGES=""
 #切换到 root 用户以便安装软件包和使用 pip 安装包
 USER root
 
+RUN mkdir -p /data && chown -R 1000:1000 /data
+
 #安装 git、curl、jq 以及额外 apt 包
 RUN apt-get update && apt-get install -y git jq curl ${APT_PACKAGES} && \
     rm -rf /var/lib/apt/lists/*

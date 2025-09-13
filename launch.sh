@@ -13,10 +13,20 @@ BASE="$(cd "$BASE" && pwd)"
 
 # 数据目录 - 在 Hugging Face Spaces 使用 /data 目录
 DATA_DIR="${DATA_DIR:-/data}"
-# 如果 /data 不存在或不可写，回退到 BASE
-if [ ! -d "$DATA_DIR" ] || [ ! -w "$DATA_DIR" ]; then
-  DATA_DIR="$BASE"
-  LOG "警告: /data 目录不可用，使用 $BASE 作为数据目录"
+
+# 尝试创建 /data 目录（如果有权限）
+if [ ! -d "$DATA_DIR" ]; then
+  mkdir -p "$DATA_DIR" 2>/dev/null || true
+fi
+
+# 检查 /data 目录是否可写
+if [ -d "$DATA_DIR" ] && [ -w "$DATA_DIR" ]; then
+  LOG "使用 $DATA_DIR 作为数据目录"
+else
+  # 如果 /data 不可用，尝试使用 $BASE/data
+  DATA_DIR="${BASE}/data"
+  mkdir -p "$DATA_DIR" 2>/dev/null || true
+  LOG "使用 $DATA_DIR 作为数据目录（/data 不可用）"
 fi
 
 # 管理的目标（相对 BASE，目录会递归处理）
