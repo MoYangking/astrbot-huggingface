@@ -166,7 +166,27 @@ link_targets() {
     local dst="${HIST_DIR}/${target}"
     mkdir -p "$(dirname "${dst}")"
     if [ -e "${src}" ] && [ ! -L "${src}" ]; then
-      LOG "初始化目标: ${target}"; mv -f "${src}" "${dst}"
+      LOG "初始化目标: ${target}"
+      # 使用 rsync 或 cp -a 来合并内容，而不是 mv
+      if [ -d "${src}" ]; then
+        # 对于目录，使用 rsync 合并内容
+        if command -v rsync >/dev/null 2>&1; then
+          rsync -av --ignore-existing "${src}/" "${dst}/" || cp -anr "${src}/." "${dst}/"
+        else
+          cp -anr "${src}/." "${dst}/"
+        fi
+        # 成功复制后删除源目录
+        rm -rf "${src}"
+      else
+        # 对于文件，如果目标不存在才移动
+        if [ ! -e "${dst}" ]; then
+          mv -f "${src}" "${dst}"
+        else
+          # 如果目标已存在，保留原有文件，删除源文件
+          LOG "目标已存在，保留: ${dst}"
+          rm -f "${src}"
+        fi
+      fi
     fi
     if [ -e "${dst}" ]; then
       if [ -L "${src}" ]; then
