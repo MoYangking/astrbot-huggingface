@@ -1,12 +1,7 @@
 FROM ghcr.io/moyangking/astrbot-lagrange-docker:main
 
 EXPOSE 6185
-EXPOSE 8000
-
-ENV BASE_URL=https://generativelanguage.googleapis.com/v1beta
-ENV TOOLS_CODE_EXECUTION_ENABLED=false
-ENV IMAGE_MODELS='["gemini-2.0-flash"]'
-ENV SEARCH_MODELS='["gemini-2.0-flash"]'
+EXPOSE 8484
 
 ARG APP_HOME=/app
 
@@ -31,17 +26,15 @@ RUN if [ ! -z "${PIP_PACKAGES}" ]; then pip install ${PIP_PACKAGES}; fi
 #将工作目录设置为 /app
 WORKDIR ${APP_HOME}
 
-#克隆代码到临时目录，然后复制到工作目录以避免 "directory not empty" 错误
-RUN git clone --depth=1 https://github.com/snailyp/gemini-balance.git /tmp/gemini-balance && \
-    cp -a /tmp/gemini-balance/. . && \
-
-#安装 requirements.txt
-    rm -rf /tmp/gemini-balance && \
-    pip install --no-cache-dir -r requirements.txt
+#下载并解压 clewdr
+RUN curl -fsSL https://github.com/Xerxes-2/clewdr/releases/download/v0.11.14/clewdr-linux-x86_64.zip -o /tmp/clewdr.zip && \
+    unzip /tmp/clewdr.zip -d /app && \
+    rm /tmp/clewdr.zip && \
+    chmod +x /app/clewdr
 
 #确保启动脚本和 supervisord 配置
-    COPY launch.sh /app/launch.sh
-    COPY supervisord.conf /app/supervisord.conf
+COPY launch.sh /app/launch.sh
+COPY supervisord.conf /app/supervisord.conf
 RUN curl -JLO https://github.com/bincooo/SillyTavern-Docker/releases/download/v1.0.0/git-batch
 
 #确保执行权限

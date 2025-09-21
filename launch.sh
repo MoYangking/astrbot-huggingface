@@ -15,7 +15,7 @@ HIST_DIR="${HIST_DIR:-${DATA_ROOT}/history}"
 mkdir -p "${DATA_ROOT}" "${HIST_DIR}" >/dev/null 2>&1 || true
 
 # 管理的目标（相对 BASE，目录会递归处理）
-TARGETS="${TARGETS:-appsettings.json data device.json keystore.json lagrange-0-db qr-0.png}"
+TARGETS="${TARGETS:-appsettings.json data device.json keystore.json lagrange-0-db qr-0.png clewdr.toml}"
 
 # 行为/阈值
 LARGE_THRESHOLD="${LARGE_THRESHOLD:-52428800}"   # 50MB
