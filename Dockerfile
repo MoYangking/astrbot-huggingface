@@ -16,8 +16,8 @@ USER root
 
 RUN mkdir -p /data && chown -R 1000:1000 /data
 
-#安装 git、curl、jq 以及额外 apt 包
-RUN apt-get update && apt-get install -y git jq curl ${APT_PACKAGES} && \
+#安装 git、curl、jq、unzip 以及额外 apt 包
+RUN apt-get update && apt-get install -y git jq curl unzip ${APT_PACKAGES} && \
     rm -rf /var/lib/apt/lists/*
 
 #安装额外的 pip 包
