@@ -26,6 +26,16 @@ VERIFY_SHA="${VERIFY_SHA:-true}"
 DOWNLOAD_RETRY="${DOWNLOAD_RETRY:-3}"
 SCAN_INTERVAL_SECS="${SCAN_INTERVAL_SECS:-7200}" # 大文件每2小时强制复查
 
+# 小文件打包配置
+BUNDLE_SMALL_FILES="${BUNDLE_SMALL_FILES:-true}"    # 是否启用小文件打包
+BUNDLE_FILE_COUNT="${BUNDLE_FILE_COUNT:-300}"       # 触发打包的最小文件数
+BUNDLE_DIR="${BUNDLE_DIR:-.bundles}"                # 打包文件存放目录
+MONITOR_INTERVAL="${MONITOR_INTERVAL:-30}"          # 监控循环间隔（秒）
+
+# Git 克隆优化
+SHALLOW_CLONE="${SHALLOW_CLONE:-true}"              # 是否使用浅克隆
+SHALLOW_DEPTH="${SHALLOW_DEPTH:-1}"                 # 浅克隆深度（1=只保留最新提交）
+
 # 阻塞等待策略
 HYDRATE_CHECK_INTERVAL="${HYDRATE_CHECK_INTERVAL:-3}"
 HYDRATE_TIMEOUT="${HYDRATE_TIMEOUT:-0}"          # 0=无限等
@@ -128,8 +138,22 @@ ensure_repo() {
     git -C "${HIST_DIR}" config user.name "complete-Mmx"
     git -C "${HIST_DIR}" config pull.rebase true
     git -C "${HIST_DIR}" config rebase.autostash true
+    # Git 性能优化
+    git -C "${HIST_DIR}" config feature.manyFiles true
+    git -C "${HIST_DIR}" config core.untrackedCache true
+    git -C "${HIST_DIR}" config index.version 4
+    git -C "${HIST_DIR}" config fetch.prune true
+    git -C "${HIST_DIR}" config pack.threads 0
+    git -C "${HIST_DIR}" config gc.auto 0
   else
     LOG "Git仓库已存在"
+    # 确保性能优化配置（兼容已有仓库）
+    git -C "${HIST_DIR}" config feature.manyFiles true >/dev/null 2>&1 || true
+    git -C "${HIST_DIR}" config core.untrackedCache true >/dev/null 2>&1 || true
+    git -C "${HIST_DIR}" config index.version 4 >/dev/null 2>&1 || true
+    git -C "${HIST_DIR}" config fetch.prune true >/dev/null 2>&1 || true
+    git -C "${HIST_DIR}" config pack.threads 0 >/dev/null 2>&1 || true
+    git -C "${HIST_DIR}" config gc.auto 0 >/dev/null 2>&1 || true
     local current_branch
     current_branch="$(git -C "${HIST_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
     if [ "${current_branch}" != "main" ]; then git -C "${HIST_DIR}" checkout -B main || true; fi
@@ -153,9 +177,33 @@ ensure_repo() {
 
   if git -C "${HIST_DIR}" remote | grep -q '^origin$'; then
     LOG "尝试从远程仓库拉取数据..."
-    git -C "${HIST_DIR}" fetch origin main || true
-    git_sanitize_repo
-    git -C "${HIST_DIR}" pull --rebase --autostash origin main || true
+    
+    # 使用浅克隆减少数据传输
+    if [ "${SHALLOW_CLONE}" = "true" ]; then
+      LOG "使用浅克隆（深度=${SHALLOW_DEPTH}）"
+      # 首次 fetch 使用 --depth
+      if ! git -C "${HIST_DIR}" rev-parse --verify origin/main >/dev/null 2>&1; then
+        git -C "${HIST_DIR}" fetch --depth="${SHALLOW_DEPTH}" origin main || true
+      else
+        # 已有历史时，尝试浅化
+        git -C "${HIST_DIR}" fetch --depth="${SHALLOW_DEPTH}" origin main || \
+          git -C "${HIST_DIR}" fetch origin main || true
+      fi
+      
+      git_sanitize_repo
+      
+      # 浅克隆的 pull
+      if ! git -C "${HIST_DIR}" pull --depth="${SHALLOW_DEPTH}" --rebase --autostash origin main 2>/dev/null; then
+        # 如果浅克隆 pull 失败，尝试普通 pull
+        LOG "浅克隆 pull 失败，尝试普通模式"
+        git -C "${HIST_DIR}" pull --rebase --autostash origin main || true
+      fi
+    else
+      # 普通克隆模式
+      git -C "${HIST_DIR}" fetch origin main || true
+      git_sanitize_repo
+      git -C "${HIST_DIR}" pull --rebase --autostash origin main || true
+    fi
   fi
 }
 
@@ -373,6 +421,89 @@ process_large_file() {
   fi
 }
 
+# ---------- 小文件打包 ----------
+count_files_in_dir() {
+  local dir="$1"
+  [ -d "$dir" ] || { echo 0; return; }
+  find "$dir" -type f ! -name '*.pointer' ! -path '*/.git/*' ! -path '*/.bundles/*' 2>/dev/null | wc -l
+}
+
+pack_small_files_in_target() {
+  local target="$1"
+  [ "${BUNDLE_SMALL_FILES}" != "true" ] && return 0
+  
+  local root="${HIST_DIR}/${target}"
+  [ -d "$root" ] || return 0
+  
+  local file_count; file_count="$(count_files_in_dir "$root")"
+  if [ "$file_count" -lt "${BUNDLE_FILE_COUNT}" ]; then
+    return 0
+  fi
+  
+  LOG "打包小文件目录: ${target} (${file_count} 个文件)"
+  
+  # 创建打包目录
+  local bundle_path="${HIST_DIR}/${BUNDLE_DIR}"
+  mkdir -p "$bundle_path"
+  
+  # 生成包文件名（包含时间戳避免冲突）
+  local ts; ts="$(date +%Y%m%d_%H%M%S)"
+  local bundle_name="${target//\//_}_${ts}.tar.gz"
+  local bundle_file="${bundle_path}/${bundle_name}"
+  
+  # 打包（优先使用 pigz 多核压缩）
+  if command -v pigz >/dev/null 2>&1; then
+    tar -cf - -C "${HIST_DIR}" "${target}" 2>/dev/null | pigz > "$bundle_file"
+  else
+    tar -czf "$bundle_file" -C "${HIST_DIR}" "${target}" 2>/dev/null
+  fi
+  
+  if [ ! -f "$bundle_file" ] || [ "$(file_size "$bundle_file" || echo 0)" = "0" ]; then
+    ERR "打包失败: ${target}"
+    rm -f "$bundle_file" 2>/dev/null || true
+    return 1
+  fi
+  
+  # 记录解包标记文件路径
+  local unpack_marker="${bundle_file}.unpacked"
+  
+  # 把原目录加入 .gitignore（避免提交小文件）
+  ensure_gitignore_entry "$target"
+  ensure_gitignore_entry "${target}/"
+  
+  # 从 Git 索引中移除原目录
+  git -C "${HIST_DIR}" rm -rf --cached "$target" >/dev/null 2>&1 || true
+  
+  # 强制指针化这个包（临时降低阈值）
+  local saved_threshold="${LARGE_THRESHOLD}"
+  export LARGE_THRESHOLD=1
+  process_large_file "" "$bundle_file"
+  export LARGE_THRESHOLD="$saved_threshold"
+  
+  # 创建元数据文件（记录这是个需要解包的包）
+  local meta_file="${bundle_file}.meta"
+  jq -nc --arg target "$target" --arg ts "$ts" '{
+    type: "bundle",
+    target_dir: $target,
+    created_at: $ts,
+    file_count: '$file_count'
+  }' > "$meta_file"
+  git -C "${HIST_DIR}" add -f "$meta_file" || true
+  
+  LOG "打包完成: ${bundle_name} ($(file_size "$bundle_file" || echo 0) bytes)"
+}
+
+pack_small_targets() {
+  [ "${BUNDLE_SMALL_FILES}" != "true" ] && return 0
+  
+  for target in $TARGETS; do
+    local root="${HIST_DIR}/${target}"
+    if [ -d "$root" ]; then
+      pack_small_files_in_target "$target" || true
+    fi
+  done
+}
+
 pointerize_large_files() {
   local release_id=""; if [ -n "${github_project:-}" ] && [ -n "${github_secret:-}" ]; then release_id="$(gh_ensure_release || echo "")"; fi
   for target in $TARGETS; do
@@ -542,6 +673,61 @@ hydrate_one_pointer() {
   fi
 
   mv -f "$tmp" "$dst"; chmod 0644 "$dst" || true
+  
+  # 检查是否需要解包（针对 .bundles 目录的 tar.gz）
+  if [[ "$rel_path" == "${BUNDLE_DIR}/"*.tar.gz ]]; then
+    unpack_bundle_if_needed "$dst" "$rel_path"
+  fi
+}
+
+# 解包函数
+unpack_bundle_if_needed() {
+  local bundle_file="$1"
+  local rel_path="$2"
+  
+  [ -f "$bundle_file" ] || return 0
+  
+  # 检查解包标记
+  local unpack_marker="${bundle_file}.unpacked"
+  if [ -f "$unpack_marker" ]; then
+    return 0  # 已解包
+  fi
+  
+  # 读取元数据
+  local meta_file="${bundle_file}.meta"
+  local target_dir=""
+  if [ -f "$meta_file" ]; then
+    target_dir="$(jq -r '.target_dir // empty' "$meta_file" 2>/dev/null || echo "")"
+  fi
+  
+  if [ -z "$target_dir" ]; then
+    # 从文件名推断目标目录
+    local basename; basename="$(basename "$bundle_file" .tar.gz)"
+    target_dir="${basename%%_*}"
+    target_dir="${target_dir//_/\/}"
+  fi
+  
+  LOG "解包文件包: ${rel_path} -> ${target_dir}"
+  
+  # 解包（优先使用 pigz）
+  if command -v pigz >/dev/null 2>&1; then
+    pigz -dc "$bundle_file" | tar -xf - -C "${HIST_DIR}" 2>/dev/null
+  else
+    tar -xzf "$bundle_file" -C "${HIST_DIR}" 2>/dev/null
+  fi
+  
+  if [ $? -eq 0 ]; then
+    # 创建解包标记
+    date +%s > "$unpack_marker"
+    LOG "解包成功: ${target_dir}"
+    
+    # 确保目标目录在 .gitignore 中
+    ensure_gitignore_entry "$target_dir"
+    ensure_gitignore_entry "${target_dir}/"
+  else
+    ERR "解包失败: ${rel_path}"
+    return 1
+  fi
 }
 
 hydrate_from_pointers() {
@@ -554,6 +740,16 @@ hydrate_from_pointers() {
       hydrate_one_pointer "${root}.pointer" || true
     fi
   done
+  
+  # 额外检查 .bundles 目录中的包是否需要解包
+  local bundle_path="${HIST_DIR}/${BUNDLE_DIR}"
+  if [ -d "$bundle_path" ]; then
+    find "$bundle_path" -type f -name '*.tar.gz' -print0 2>/dev/null \
+      | while IFS= read -r -d '' bundle; do
+        local rel="${bundle#${HIST_DIR}/}"
+        unpack_bundle_if_needed "$bundle" "$rel" || true
+      done
+  fi
 }
 
 # ---------- 就绪判断/阻塞等待 ----------
@@ -619,6 +815,12 @@ wait_until_hydrated() {
 # ---------- 提交/推送（自愈 rebase、push 重试） ----------
 commit_and_push() {
   local dir="${HIST_DIR}"
+  
+  # 推送前执行 git repack 优化
+  if [ -d "${dir}/.git" ]; then
+    git -C "$dir" repack -Ad -l -q --threads=0 2>/dev/null || true
+  fi
+  
   local lock="/tmp/history-git.lock"
   exec {lockfd}>"$lock" || true
   if ! flock -n "$lockfd"; then
@@ -636,7 +838,14 @@ commit_and_push() {
   if git -C "$dir" remote | grep -q '^origin$'; then
     local pushed=0 attempt
     for attempt in 1 2 3; do
-      git -C "$dir" fetch origin main || true
+      # 使用浅克隆 fetch 减少数据传输
+      if [ "${SHALLOW_CLONE}" = "true" ]; then
+        git -C "$dir" fetch --depth="${SHALLOW_DEPTH}" origin main 2>/dev/null || \
+          git -C "$dir" fetch origin main || true
+      else
+        git -C "$dir" fetch origin main || true
+      fi
+      
       if ! git -C "$dir" pull --rebase --autostash origin main; then
         git -C "$dir" rebase --abort >/dev/null 2>&1 || true
         LOG "pull --rebase 失败（第${attempt}次），继续重试"
@@ -662,6 +871,7 @@ commit_and_push() {
 # ---------- 监控 ----------
 monitor_tick() {
   for target in $TARGETS; do process_target "$target"; done
+  pack_small_targets
   pointerize_large_files
   hydrate_from_pointers
   commit_and_push
@@ -671,7 +881,7 @@ start_monitor() {
   set +e
   while true; do
     if ! monitor_tick; then ERR "本轮监控出现错误，继续下一轮"; fi
-    sleep 5
+    sleep "${MONITOR_INTERVAL}"
   done
   set -e
 }
@@ -682,6 +892,7 @@ do_init() {
   ensure_repo
   link_targets
 
+  pack_small_targets
   pointerize_large_files
   commit_and_push
 
@@ -701,8 +912,16 @@ do_init() {
 # ---------- 其它命令 ----------
 release() { rm -rf "${HIST_DIR}"; }
 update() {
-  if git -C "${HIST_DIR}" remote | grep -q '^origin$'; then git -C "${HIST_DIR}" pull --rebase --autostash origin main || true; fi
+  if git -C "${HIST_DIR}" remote | grep -q '^origin$'; then
+    if [ "${SHALLOW_CLONE}" = "true" ]; then
+      git -C "${HIST_DIR}" pull --depth="${SHALLOW_DEPTH}" --rebase --autostash origin main 2>/dev/null || \
+        git -C "${HIST_DIR}" pull --rebase --autostash origin main || true
+    else
+      git -C "${HIST_DIR}" pull --rebase --autostash origin main || true
+    fi
+  fi
   link_targets
+  pack_small_targets
   pointerize_large_files
   wait_until_hydrated
   commit_and_push
