@@ -2,6 +2,7 @@ FROM ghcr.io/moyangking/astrbot-lagrange-docker:main
 
 EXPOSE 6185
 EXPOSE 8484
+EXPOSE 8000
 
 ARG APP_HOME=/app
 
@@ -16,21 +17,25 @@ USER root
 
 RUN mkdir -p /data && chown -R 1000:1000 /data
 
-#安装 git、curl、jq、unzip、rsync、pigz（多核压缩）以及额外 apt 包
-RUN apt-get update && apt-get install -y git jq curl unzip rsync pigz ${APT_PACKAGES} && \
+#安装 git、curl、jq、unzip、rsync 以及额外 apt 包
+RUN apt-get update && apt-get install -y git jq curl unzip rsync ${APT_PACKAGES} && \
     rm -rf /var/lib/apt/lists/*
 
 #安装额外的 pip 包
 RUN if [ ! -z "${PIP_PACKAGES}" ]; then pip install ${PIP_PACKAGES}; fi
 
+#下载 gemini-balance 项目
+RUN git clone https://github.com/snailyp/gemini-balance.git ${APP_HOME}/gemini && \
+    cd ${APP_HOME}/gemini && \
+    pip install --no-cache-dir -r requirements.txt
+
+#设置 gemini 环境变量
+ENV API_KEYS='["your_api_key_1"]'
+ENV ALLOWED_TOKENS='["your_token_1"]'
+ENV TZ='Asia/Shanghai'
+
 #将工作目录设置为 /app
 WORKDIR ${APP_HOME}
-
-#下载并解压 clewdr
-RUN curl -fsSL https://github.com/Xerxes-2/clewdr/releases/download/v0.11.14/clewdr-linux-x86_64.zip -o /tmp/clewdr.zip && \
-    unzip /tmp/clewdr.zip -d /app && \
-    rm /tmp/clewdr.zip && \
-    chmod +x /app/clewdr
 
 #确保启动脚本和 supervisord 配置
 COPY launch.sh /app/launch.sh
